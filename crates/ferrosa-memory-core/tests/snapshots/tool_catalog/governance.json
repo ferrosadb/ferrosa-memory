@@ -1,0 +1,434 @@
+[
+  {
+    "name": "rules",
+    "description": "CRUD for Datalog rule registry.\n\nCALL WHEN:\n- Adding custom inference rules\n- Listing active rules\n- Deprecating old rules\n\nCost: Low (registry operations).",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "CRUD action",
+          "enum": [
+            "list",
+            "get",
+            "put",
+            "deprecate"
+          ],
+          "type": "string"
+        },
+        "family": {
+          "description": "Rule family (for list/put)",
+          "type": "string"
+        },
+        "name": {
+          "description": "Human-readable name (for put)",
+          "type": "string"
+        },
+        "rule_body": {
+          "description": "Datalog rule text (for put)",
+          "type": "string"
+        },
+        "rule_id": {
+          "description": "Rule ID (for get/put/deprecate)",
+          "type": "string"
+        },
+        "rule_weight": {
+          "description": "Rule confidence weight (default 1.0)",
+          "type": "number"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "claims",
+    "description": "Manage expert-system claims stored as entity-backed review artifacts.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "enum": [
+            "list",
+            "get",
+            "put"
+          ],
+          "type": "string"
+        },
+        "claim_id": {
+          "type": "string"
+        },
+        "claim_text": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number"
+        },
+        "domain": {
+          "type": "string"
+        },
+        "include_unapproved": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "source_ref": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "proposed",
+            "approved",
+            "rejected"
+          ],
+          "type": "string"
+        },
+        "support_count": {
+          "type": "integer"
+        },
+        "workspace_scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "approvals",
+    "description": "Append and inspect approval decisions for rules, claims, aliases, and other governed artifacts.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "enum": [
+            "list",
+            "record",
+            "latest"
+          ],
+          "type": "string"
+        },
+        "artifact_kind": {
+          "enum": [
+            "rule",
+            "claim",
+            "alias",
+            "skill"
+          ],
+          "type": "string"
+        },
+        "artifact_ref": {
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "proposed",
+            "approved",
+            "rejected"
+          ],
+          "type": "string"
+        },
+        "review_note": {
+          "type": "string"
+        },
+        "reviewer": {
+          "description": "Ignored; reviewer is always auth-derived.",
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "session_scope": {
+          "type": "string"
+        },
+        "workspace_scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "artifact_kind",
+        "artifact_ref"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "aliases",
+    "description": "Manage exact-scope tool aliases for deterministic execution-time rewrites.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "enum": [
+            "list",
+            "put",
+            "resolve"
+          ],
+          "type": "string"
+        },
+        "alias_name": {
+          "type": "string"
+        },
+        "args_templates": {
+          "type": "object"
+        },
+        "canonical_tool": {
+          "type": "string"
+        },
+        "fixed_arguments": {
+          "type": "object"
+        },
+        "parameter_map": {
+          "type": "object"
+        },
+        "scope_kind": {
+          "enum": [
+            "global",
+            "workspace",
+            "session"
+          ],
+          "type": "string"
+        },
+        "scope_ref": {
+          "type": "string"
+        },
+        "session_scope": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "proposed",
+            "approved",
+            "rejected"
+          ],
+          "type": "string"
+        },
+        "workspace_scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "alias_name"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "explain",
+    "description": "Return a bounded explanation for derived facts, including support chain and approval metadata.",
+    "inputSchema": {
+      "properties": {
+        "dst_id": {
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "predicate": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "src_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predicate"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "ruleset",
+    "description": "Inspect the merged runtime-effective rule set, including synthetic built-ins and approved registry rules.",
+    "inputSchema": {
+      "properties": {
+        "family": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

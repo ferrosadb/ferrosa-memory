@@ -1,0 +1,317 @@
+[
+  {
+    "name": "search",
+    "description": "Search across ALL memory types at once — entities, folds, and facts — using Reciprocal Rank Fusion to merge results.\n\nCALL AT THE START OF EVERY NEW TASK or when the user asks about something that might have prior context. This is your 'what do I already know about this?' tool.\n\nExamples of when to search:\n- User mentions a project, person, or concept → search for prior context\n- Starting implementation → search for related decisions and patterns\n- Debugging → search for prior bugs in the same area\n- User asks 'remember when...' → search for the memory\n\nProvide embedding for ANN strategies; without it only phonetic matching runs.\nCost: ~15ms.",
+    "inputSchema": {
+      "properties": {
+        "candidate_limit": {
+          "description": "Per-source candidate fanout before fusion. Defaults to min(limit*2, 50); lower it to reduce retrieval work.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "chunk_expansion": {
+          "description": "Expand document_chunk hits before reranking/returning. neighbors adds bounded prev/next chunks.",
+          "enum": [
+            "none",
+            "neighbors"
+          ],
+          "type": "string"
+        },
+        "chunk_max_tokens": {
+          "description": "Approximate added-token budget per result for chunk expansion.",
+          "maximum": 8000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "chunk_next": {
+          "description": "Next document chunks to include when chunk_expansion=neighbors.",
+          "maximum": 5,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunk_prev": {
+          "description": "Previous document chunks to include when chunk_expansion=neighbors.",
+          "maximum": 5,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwd": {
+          "description": "Current agent working directory. Results learned in the same directory tree receive a bounded reranking boost.",
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "datalog_frontier": {
+          "description": "Enable bounded Datalog-style graph frontier expansion from entity seeds. Default true when the fusion profile includes datalog_frontier.",
+          "type": "boolean"
+        },
+        "datalog_frontier_edge_limit": {
+          "description": "Maximum typed edges considered per frontier node. Defaults to 12.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "datalog_frontier_max_hops": {
+          "description": "Maximum graph hops for inferred recall. Defaults to 2.",
+          "maximum": 3,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "datalog_frontier_min_confidence": {
+          "description": "Suppress derived frontier candidates below this edge/derived confidence. Defaults to 0.30.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "datalog_frontier_seed_limit": {
+          "description": "Maximum entity seeds to expand from initial candidates. Defaults to candidate source limit.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "embedding": {
+          "description": "Optional embedding vector for ANN search strategies",
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "fusion_profile": {
+          "description": "Named source-weight profile. Defaults to auto, which cheaply routes query intent to a fast effective profile. Use explicit profiles for deterministic ablations; use all/phonetic profiles for recall-heavy runs.",
+          "enum": [
+            "auto",
+            "default",
+            "all",
+            "bm25-only",
+            "semantic-only",
+            "bm25-semantic",
+            "bm25-semantic-workspace",
+            "bm25-semantic-phonetic",
+            "bm25-semantic-phonetic-workspace"
+          ],
+          "type": "string"
+        },
+        "fusion_weights": {
+          "description": "Optional numeric source weight overrides, e.g. {\"document_bm25\":2.5,\"document_ann\":1.5,\"document_phonetic\":0}.",
+          "type": "object"
+        },
+        "include_cross_session": {
+          "description": "Compatibility flag, overridden by an explicit scope. When scope is omitted: the default already spans session+global; pass false to restrict to the current session, true to force both.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max results to return (default: 10)",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "memory_kinds": {
+          "description": "Optional result category filter applied before return.",
+          "items": {
+            "enum": [
+              "episodic",
+              "procedural",
+              "semantic"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "min_score": {
+          "description": "Drop fused results below this score before returning them. Useful for hooks where silence is better than weak recall.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "offset": {
+          "description": "Skip this many fused results for pagination. Use offset=5 after scoring the first 5 as irrelevant.",
+          "maximum": 49,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Search query text (used for phonetic matching)",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "query_decomposition": {
+          "description": "Generate bounded query variants and RRF-union their candidate sets before reranking. llm uses the configured judge model. Default none.",
+          "enum": [
+            "none",
+            "heuristic",
+            "llm"
+          ],
+          "type": "string"
+        },
+        "query_embed_variants": {
+          "description": "When true and an embedding provider is configured, embed each query variant separately. Default false.",
+          "type": "boolean"
+        },
+        "query_task": {
+          "description": "Task hint for query decomposition prompt shaping. Default general.",
+          "enum": [
+            "general",
+            "bright_pro",
+            "memorybench"
+          ],
+          "type": "string"
+        },
+        "query_variant_limit": {
+          "description": "Maximum total query variants, including the original query. Default 5.",
+          "maximum": 8,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query_variants": {
+          "description": "Caller-provided extra query variants to union with the primary query.",
+          "items": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "rerank": {
+          "description": "Override live LLM reranking for this call. Defaults to [judge].enabled.",
+          "type": "boolean"
+        },
+        "rerank_candidates": {
+          "description": "Override how many top candidates the judge reranker sees. Keep small for token economy; evals may use 25.",
+          "maximum": 50,
+          "minimum": 2,
+          "type": "integer"
+        },
+        "scope": {
+          "description": "session=current session only; global=tenant global plus legacy nil session; both=session+global. Default both, so curated global/skill corpus is retrievable; pass session to restrict to the current session.",
+          "enum": [
+            "session",
+            "global",
+            "both"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "workspace_cwd": {
+          "description": "Alias for cwd; explicit workspace path used for reranking affinity.",
+          "maxLength": 1024,
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "authority",
+    "description": "Set user-managed authority for retrieved memories. Use this to mark curated corpus chunks, skills, or other memory IDs as high reputation/PageRank, or to demote known clutter. Authority is applied to future hybrid_search ranking after normal relevance scoring.\n\nCALL WHEN: The user explicitly says a result/source is curated, authoritative, trusted, or noisy. Prefer global scope for curated corpus/skills and session scope for local one-off preferences.",
+    "inputSchema": {
+      "properties": {
+        "global": {
+          "description": "Compatibility shortcut for scope=global.",
+          "type": "boolean"
+        },
+        "pagerank": {
+          "description": "Authority/PageRank seed. 1.0 strongly boosts authoritative curated material.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "reason": {
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "reputation": {
+          "description": "User-managed trust score. 1.0=curated/highest trust, 0=neutral, -1.0=known clutter.",
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        "scope": {
+          "description": "Where to store this authority. global applies to tenant-global searches; session applies to the current session. Default session unless global=true.",
+          "enum": [
+            "session",
+            "global"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "target_id": {
+          "description": "Memory result ID to update.",
+          "type": "string"
+        },
+        "target_ids": {
+          "description": "Multiple memory result IDs to update with the same authority values.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

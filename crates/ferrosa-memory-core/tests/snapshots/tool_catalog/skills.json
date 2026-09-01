@@ -1,0 +1,350 @@
+[
+  {
+    "name": "skill_ingest",
+    "description": "Ingest a methodology into the global skill catalog. Skills are shared across all sessions and tenants' queries.\n\nCALL WHEN: You encounter or refine a reusable methodology — TDD, STRIDE threat modeling, debugging process, refactoring pattern, etc.\n\nThe server generates the version (YYYYMMDDNN) — do not pass it. Pass content_hash for idempotent re-ingest; re-running with an unchanged hash is a no-op.\n\nSkills are stored with entity_type='skill', scope='global'. Category and additional tags become tag entities + TAGGED_AS edges. Prerequisites become REQUIRES edges. If a prerequisite skill doesn't exist yet, its name is recorded in `missing_prerequisites` on the response — the skill itself still lands. Either ingest the missing prereqs and re-run this skill, or accept the partial graph.\n\nTAG NORMALIZATION: category and tags are normalized to lowercase, alphanumeric + dash only. Any other character (including underscore, space, slash) becomes `-`; consecutive dashes collapse and leading/trailing dashes are stripped. Example: 'Chaos Engineering' → 'chaos-engineering', 'unit_testing' → 'unit-testing', 'foo/bar/baz' → 'foo-bar-baz'. Use the same normalized form when calling retrieve_skills_for_context or ensure_parent_tag.\n\nLEARN AND REFINE: If you use a skill and discover a better step, a missing prerequisite, or a clearer description, call ingest_skill again to refine it. Your changes persist across all sessions.\nCost: ~20ms + one embed call for description.",
+    "inputSchema": {
+      "properties": {
+        "category": {
+          "description": "Primary tag (e.g., 'testing', 'security'). Becomes a tag entity + TAGGED_AS edge.",
+          "maxLength": 128,
+          "type": "string"
+        },
+        "completion_criteria": {
+          "description": "How to tell when the skill's work is done.",
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "content_hash": {
+          "description": "Caller-computed content hash for idempotent re-ingest. Passing the same hash as the stored skill is a no-op.",
+          "maxLength": 128,
+          "type": "string"
+        },
+        "description": {
+          "description": "2-4 sentence description of what the skill does and when to use it. Embedded for retrieval.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "name": {
+          "description": "Unique skill identifier (e.g., 'tdd', 'threat-model')",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "output_artifacts": {
+          "description": "Artifacts the skill produces (e.g., 'checklist', 'diagram').",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "prerequisites": {
+          "description": "Names of other skills this requires.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "description": "Caller's session UUID (optional, recorded for audit). Omit or pass 'default' to use the configured default session.",
+          "type": "string"
+        },
+        "steps": {
+          "description": "Ordered steps to follow when invoking the skill.",
+          "items": {
+            "properties": {
+              "instruction": {
+                "type": "string"
+              },
+              "phase": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "instruction"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "tags": {
+          "description": "Additional tags beyond category.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "trigger_keywords": {
+          "description": "Keywords that indicate this skill is relevant.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "category",
+        "description"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "skills",
+    "description": "Find methodologies relevant to your current task from the global skill catalog.\n\nCALL AT TASK START or whenever you encounter a problem you've solved before — 'how do I test this?', 'how should I refactor this?', 'what's the threat model here?'\n\nReturns ranked skills with description, category, version, and a used_in_session flag. Match scoring combines description-embedding similarity, trigger_keyword overlap, tag overlap, and name hits.\n\nThese skills are GLOBAL — shared across every session. If a result is marked used_in_session=true, you've already touched it this session, which is a strong relevance signal.\nCost: O(catalog size) — typically <20ms for 100s of skills.",
+    "inputSchema": {
+      "properties": {
+        "context": {
+          "description": "Current task context — what you're working on, the problem statement, or a natural-language question.",
+          "maxLength": 8192,
+          "type": "string"
+        },
+        "embedding": {
+          "description": "Optional context embedding. When present, enables semantic matching against skill description_embeddings.",
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "limit": {
+          "description": "Max results (default 5).",
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_score": {
+          "description": "Minimum score threshold (default 0.0 returns all).",
+          "maximum": 2.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "session_id": {
+          "description": "Caller's session UUID (optional, used for the used_in_session flag).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "context"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "skill",
+    "description": "Fetch the structured steps for a named skill. Returns {description, steps, first_step_prompt, completion_criteria, output_artifacts}.\n\nCALL WHEN: You've decided to apply a skill by name (e.g., after retrieve_skills_for_context returned it, or the user explicitly asked 'use TDD').\n\nThe response is pure data. Execute the steps yourself — invoke_skill does not orchestrate tool calls. Start with first_step_prompt. Check completion_criteria when you finish.\n\nMissed skill returns INVALID_PARAMS with a did_you_mean list of similar skill names (phonetic match). Ingest the skill with ingest_skill if it genuinely doesn't exist yet.\nCost: ~5ms.",
+    "inputSchema": {
+      "properties": {
+        "current_context": {
+          "description": "Optional context hint — what you're working on right now.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Caller's session UUID (optional; used for prerequisite-satisfaction tracking).",
+          "type": "string"
+        },
+        "skill_name": {
+          "description": "Exact name of the skill to invoke (case-sensitive).",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_name"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "tag_parent",
+    "description": "Idempotently create a PARENT_TAG edge between two tags in the global taxonomy, resolving tags by name (creating them if missing).\n\nCALL WHEN: Building or extending the tag hierarchy — e.g. declaring that 'tdd' is a sub-category of 'testing', or that 'testing' is a sub-category of 'quality'. forge's fmem-skill-ingest uses this when ingesting `tag-hierarchy.yaml`.\n\nTAG NORMALIZATION: names are normalized to lowercase, alphanumeric + dash only. Any other character (underscore, space, slash, etc.) becomes `-`; consecutive dashes collapse, leading/trailing dashes strip. 'Chaos Engineering' → 'chaos-engineering', 'unit_testing' → 'unit-testing'. Pre-normalize on the caller side if you want full control; otherwise the server's normalization is deterministic.\n\nReturns action=Created on first call, action=Skipped on subsequent identical calls. Cycles are rejected via the graph client's DAG check.\nCost: ~5ms for idempotent re-runs, ~20ms when creating both tags + edge.",
+    "inputSchema": {
+      "properties": {
+        "child_tag": {
+          "description": "Narrower tag name (e.g. 'tdd').",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "parent_tag": {
+          "description": "Broader tag name (e.g. 'testing').",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Caller session UUID (optional; used for ingested_by_session audit).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "child_tag",
+        "parent_tag"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "skill_verify",
+    "description": "Verify a skill's graph neighborhood for ingest pipelines and audits. Returns resolved tags, prerequisites (outgoing REQUIRES), required_by (incoming REQUIRES), and missing_prerequisites (raw names declared at ingest that never landed as edges).\n\nCALL WHEN: A bulk ingest finishes and the caller wants to confirm every skill's edges are intact. Safe to call for unknown skill names — returns {exists: false} cleanly, not an error.\n\nThis is an administrative read. For executing a skill, use invoke_skill.\nCost: ~10ms (one entity lookup + two edge scans).",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "description": "Caller session UUID (optional).",
+          "type": "string"
+        },
+        "skill_name": {
+          "description": "Exact skill name (case-sensitive).",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_name"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

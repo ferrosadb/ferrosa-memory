@@ -1,0 +1,342 @@
+[
+  {
+    "name": "intend",
+    "description": "Prospective memory — 'remember to do X when Y happens.' Sets a deferred action that auto-triggers on context match.\n\nCALL WHEN you notice something to do later:\n- 'When we touch auth, check the error handling'\n- 'Next time we open database.rs, add that index'\n- 'When user mentions deployment, remind about the TLS cert'\n- 'In 30 minutes, check if the build finished'\n\nTrigger types: Topic (keyword match), FilePattern (file glob), Duration (minutes), Context (flexible condition).\n\nIntentions are repo-scoped and persist across sessions. They trigger automatically when check_intentions runs. Set liberally — they cost nothing until triggered.\nCost: ~1ms.",
+    "inputSchema": {
+      "properties": {
+        "description": {
+          "description": "What to do when triggered",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository path for scoping (defaults to server's configured repo)",
+          "maxLength": 512,
+          "type": "string"
+        },
+        "trigger": {
+          "description": "Trigger condition",
+          "properties": {
+            "condition": {
+              "description": "For Context triggers",
+              "type": "string"
+            },
+            "keywords": {
+              "description": "For Topic triggers",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "minutes": {
+              "description": "For Duration triggers",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "pattern": {
+              "description": "For FilePattern triggers",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Topic",
+                "FilePattern",
+                "Duration",
+                "Context"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "description",
+        "trigger"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set_foresight",
+    "description": "Time-bounded memory — declare a planned-future fact or temporary constraint with a validity window. Search surfaces it ONLY while valid at the current time; expired and not-yet-active facts are filtered out automatically, so stale deadlines never pollute context.\n\nCALL WHEN a fact only holds for a window:\n- 'Code freeze until 2026-07-01' (valid_until)\n- 'Migration plan goes live on 2026-06-30' (valid_from)\n- 'API v1 is deprecated as of today' (valid_until open-ended past the cutover)\n- 'Use the staging cluster this week' (valid_from + valid_until)\n\nvalid_from/valid_until are optional RFC3339 timestamps; omit either for an open-ended bound. Cost: ~1ms.",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "The time-bounded fact or constraint",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session UUID to scope the fact to (defaults to the current session)",
+          "type": "string"
+        },
+        "valid_from": {
+          "description": "RFC3339 timestamp; the fact becomes active at this time (optional — omit for 'active now')",
+          "type": "string"
+        },
+        "valid_until": {
+          "description": "RFC3339 timestamp; the fact expires at this time (optional — omit for 'no expiry')",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "check",
+    "description": "Checks pending intentions against current context. Call FREQUENTLY — at every topic change, file open, or new task start. Pass a brief description of what you're doing now as context. Returns triggered intentions you should act on.\n\nIntentions are repo-scoped — only intentions for the current repo are checked.\nCost: ~1ms. Call often — it's free.",
+    "inputSchema": {
+      "properties": {
+        "context": {
+          "description": "Current context to check against",
+          "maxLength": 8192,
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository path (defaults to server's configured repo)",
+          "maxLength": 512,
+          "type": "string"
+        }
+      },
+      "required": [
+        "context"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "done",
+    "description": "Marks a triggered intention as completed.\n\nCALL WHEN: After you have acted on a triggered intention.\nCost: ~1ms.",
+    "inputSchema": {
+      "properties": {
+        "intention_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "intention_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "intentions",
+    "description": "Lists intentions. By default lists current repo's intentions from the in-memory store.\n\nPass all_repos: true to list intentions across ALL repos from durable storage — useful for seeing all threads you're coordinating across projects.\n\nCALL WHEN: User asks about pending intentions, wants a cross-project overview, or for debugging intention state.\nCost: ~1ms (in-memory), ~15ms (all_repos).",
+    "inputSchema": {
+      "properties": {
+        "all_repos": {
+          "description": "If true, list intentions across ALL repos from storage (not just current session)",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "snooze",
+    "description": "Snoozes a triggered intention — resets it to pending so it can trigger again later.\n\nCALL WHEN: An intention triggered but you want to defer action. Resets to pending state.\nCost: ~1ms.",
+    "inputSchema": {
+      "properties": {
+        "intention_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "intention_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

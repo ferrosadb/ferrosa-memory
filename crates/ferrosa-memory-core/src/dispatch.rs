@@ -19752,32 +19752,95 @@ mod speculative_tests {
         assert_eq!(source, "derived_from_session_id");
     }
 
-    /// Characterization snapshot of the full tool catalog. Guards the
-    /// behavior-preserving `tool_definitions` decomposition: the serialized
-    /// catalog must stay byte-identical as the giant function is split into
-    /// per-family builders. Regenerate intentionally with `UPDATE_SNAPSHOTS=1`
-    /// (only when a tool schema is deliberately changed).
+    /// Characterization snapshot of the tool catalog, ONE FILE PER FAMILY.
+    ///
+    /// Guards the behavior-preserving `tool_definitions` decomposition: each
+    /// family's serialized tools must stay byte-identical as builders move.
+    /// Regenerate intentionally with `UPDATE_SNAPSHOTS=1` (only when a tool
+    /// schema is deliberately changed).
+    ///
+    /// Split per family on purpose. A single 98-tool golden file made every
+    /// session that touched any schema rewrite the same blob, so unrelated
+    /// work collided on merge and the fix was to regenerate — which is exactly
+    /// how an unintended schema change slips through a conflict resolution.
+    /// Per-family files mean a change to `search` cannot conflict with a
+    /// change to `graph`, and the guard stays byte-exact either way.
     #[test]
     fn tool_definitions_catalog_snapshot() {
+        use std::collections::BTreeMap;
         let sample = [
             "person".to_string(),
             "place".to_string(),
             "organization".to_string(),
         ];
-        let actual = serde_json::to_string_pretty(&tool_definitions(&sample)).unwrap() + "\n";
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/snapshots/tool_definitions_catalog.json"
-        );
-        if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
-            std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
-            std::fs::write(path, &actual).unwrap();
+        let mut by_family: BTreeMap<&'static str, Vec<tool_schemas::ToolDef>> = BTreeMap::new();
+        for record in tool_schemas::tool_definition_records(&sample) {
+            by_family
+                .entry(record.category)
+                .or_default()
+                .push(record.tool);
         }
-        let expected = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            !by_family.is_empty(),
+            "the catalog produced no families at all"
+        );
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/tool_catalog");
+        if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
+            std::fs::create_dir_all(dir).unwrap();
+            // Remove files for families that no longer exist, so a deleted
+            // family cannot leave a stale golden file behind claiming it does.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let keep = entry
+                        .path()
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| by_family.contains_key(stem))
+                        .unwrap_or(false);
+                    if !keep {
+                        std::fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+            }
+            for (family, tools) in &by_family {
+                let text = serde_json::to_string_pretty(tools).unwrap() + "\n";
+                std::fs::write(format!("{dir}/{family}.json"), text).unwrap();
+            }
+        }
+
+        for (family, tools) in &by_family {
+            let path = format!("{dir}/{family}.json");
+            let actual = serde_json::to_string_pretty(tools).unwrap() + "\n";
+            let expected = std::fs::read_to_string(&path).unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "tool catalog family `{family}` changed — the refactor must be \
+                 behavior-preserving. If a schema change is intentional, \
+                 regenerate with UPDATE_SNAPSHOTS=1."
+            );
+        }
+
+        // A family that stops being produced must fail here rather than leave
+        // its golden file sitting on disk unread.
+        let on_disk: std::collections::BTreeSet<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        e.path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let produced: std::collections::BTreeSet<String> =
+            by_family.keys().map(|k| (*k).to_owned()).collect();
         assert_eq!(
-            actual, expected,
-            "tool_definitions catalog changed — the refactor must be behavior-preserving. \
-             If a schema change is intentional, regenerate with UPDATE_SNAPSHOTS=1."
+            on_disk, produced,
+            "tool catalog families on disk do not match the families produced"
         );
     }
 

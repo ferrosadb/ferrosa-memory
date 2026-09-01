@@ -1,0 +1,887 @@
+[
+  {
+    "name": "feedback_record",
+    "description": "Record terse feedback about a remote-memory candidate, classify it into a structured Packet H signal, and persist a queryable feedback explanation under the authenticated tenant.",
+    "inputSchema": {
+      "properties": {
+        "feedback": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "remote_id": {
+          "type": "string"
+        },
+        "scope": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_namespace": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_id": {
+          "description": "Remote item/entity/candidate UUID receiving feedback.",
+          "type": "string"
+        },
+        "tenant_id": {
+          "description": "Must match the authenticated tenant context.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "remote_id",
+        "target_id",
+        "source_namespace",
+        "scope",
+        "feedback"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "usage_mark",
+    "description": "Mark a remote-memory item as selected, confirmed, or successful and return a scoped trust reinforcement preview. Tenant id must match authenticated context.",
+    "inputSchema": {
+      "properties": {
+        "remote_id": {
+          "type": "string"
+        },
+        "scope": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_namespace": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_id": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "usage": {
+          "enum": [
+            "chosen",
+            "confirmed",
+            "success"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "remote_id",
+        "target_id",
+        "source_namespace",
+        "scope",
+        "usage"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "trust_update",
+    "description": "Apply scoped Packet H trust reinforcements for one remote namespace/scope and persist a not_trusted_for policy fact when repeated strong negatives cross threshold.",
+    "inputSchema": {
+      "properties": {
+        "reinforcements": {
+          "items": {
+            "enum": [
+              "chosen",
+              "policy_chosen",
+              "confirmed",
+              "user_confirmed",
+              "success",
+              "wrong_scope",
+              "strong_negative"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "remote_id": {
+          "type": "string"
+        },
+        "scope": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_namespace": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "remote_id",
+        "source_namespace",
+        "scope",
+        "reinforcements"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "teach_query_stream",
+    "description": "Teacher-side remote memory query stream. Returns a transport-neutral JSON event array beginning with a start event before retrieval completion; raw context/detail/skill output requires explicit grants.",
+    "inputSchema": {
+      "properties": {
+        "grants": {
+          "items": {
+            "enum": [
+              "raw_context",
+              "detail",
+              "skill"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_detail": {
+          "type": "boolean"
+        },
+        "include_raw_context": {
+          "type": "boolean"
+        },
+        "include_skill": {
+          "type": "boolean"
+        },
+        "learner_instance_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_items": {
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "query_embedding": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "remote_id",
+        "query"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "pull_preview",
+    "description": "Learner-side remote memory pull preview. Verifies a signed teaching packet, evaluates dry-run import policy, and reports duplicate/conflict candidates without mutating local storage.",
+    "inputSchema": {
+      "properties": {
+        "local_applicability": {
+          "type": "object"
+        },
+        "preview_ttl_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "public_identity": {
+          "description": "Teacher InstancePublicIdentity used to verify signed_packet",
+          "type": "object"
+        },
+        "query": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "remote_name": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "signed_packet": {
+          "description": "SignedEnvelope<TeachingPacket> from teach_query_stream or remote transport",
+          "type": "object"
+        }
+      },
+      "required": [
+        "remote_id",
+        "remote_name",
+        "query",
+        "public_identity",
+        "signed_packet"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "pull_commit",
+    "description": "Commit an accepted learner-side remote memory pull preview. Writes active imports with provenance, persists stubs/quarantine decisions, and records an import batch.",
+    "inputSchema": {
+      "properties": {
+        "learner_decision": {
+          "description": "SignedEnvelope<ImportDecisionPayload> authorizing this commit",
+          "type": "object"
+        },
+        "preview": {
+          "description": "PullPreviewPlan returned by pull_preview",
+          "type": "object"
+        }
+      },
+      "required": [
+        "preview",
+        "learner_decision"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_list",
+    "description": "List tenant-scoped configured remote memory providers without exposing credentials.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_add",
+    "description": "Register or replace a tenant-scoped remote memory endpoint, trust class, instance id, and public-key fingerprint. Endpoints must be HTTPS/HTTP URLs; secrets are not accepted.",
+    "inputSchema": {
+      "properties": {
+        "endpoint": {
+          "description": "HTTP(S) endpoint for the remote MCP server; do not include credentials.",
+          "type": "string"
+        },
+        "instance_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "public_key_fingerprint": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "tenant_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "trust_class": {
+          "enum": [
+            "personal",
+            "team",
+            "partner",
+            "public",
+            "archive"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "instance_id",
+        "name",
+        "endpoint",
+        "trust_class",
+        "public_key_fingerprint"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_update_policy",
+    "description": "Append tenant-scoped Datalog policy facts for a configured remote. Supported actions: read, detail_fetch, autocommit, requires_activation, should_consult, trusted_for, not_trusted_for, fallback_enabled.",
+    "inputSchema": {
+      "properties": {
+        "facts": {
+          "items": {
+            "properties": {
+              "action": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "expires_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "grant",
+                  "deny"
+                ],
+                "type": "string"
+              },
+              "namespace": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "namespace",
+              "action"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "tenant_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "remote_id",
+        "facts"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_remove",
+    "description": "Disable a configured remote while preserving import provenance and policy audit rows.",
+    "inputSchema": {
+      "properties": {
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "tenant_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "remote_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_health",
+    "description": "Report local configuration health for one remote without dialing or leaking credentials.",
+    "inputSchema": {
+      "properties": {
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "remote_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_capabilities",
+    "description": "Return the remote-memory MCP capabilities expected for a configured remote.",
+    "inputSchema": {
+      "properties": {
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "remote_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_detail",
+    "description": "Return configured remote-memory details plus the transport/security capabilities required by remote pull smokes.",
+    "inputSchema": {
+      "properties": {
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "remote_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remote_explain_policy",
+    "description": "Evaluate and explain Datalog-backed remote policy for a configured remote, action, and namespace.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "enum": [
+            "read",
+            "detail_fetch",
+            "autocommit",
+            "requires_activation",
+            "should_consult"
+          ],
+          "type": "string"
+        },
+        "namespace": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "remote_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "remote_id",
+        "action",
+        "namespace"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]
