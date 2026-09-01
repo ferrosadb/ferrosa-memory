@@ -47,6 +47,22 @@ use crate::types::*;
 /// Ordered column-name mapping extracted from a `LegacyQueryResult`.
 pub type ColMap = HashMap<String, usize>;
 
+/// The conditional claim on a consolidation request.
+///
+/// `attempt_count` is BOUND, not incremented in place. A read-modify-write
+/// inside an `IF` is a conditional update ferrosa refuses outright, and doing
+/// it anyway meant every claim failed for a week while the queue filled.
+/// The caller has just read the row, so it knows the next value; the `IF` is
+/// still what decides who wins, so only the winner's value is written.
+fn consolidation_claim_query(keyspace: &str, if_clause: &str) -> String {
+    format!(
+        "UPDATE {keyspace}.consolidation_requests \
+         SET state = 'leased', lease_owner = ?, lease_expires_at = ?, \
+             attempt_count = ?, last_error = null, completed_at = null \
+         WHERE tenant_id = ? AND session_id = ? IF {if_clause}"
+    )
+}
+
 /// Build a `ColMap` from a slice of `ColumnSpec`s.
 pub fn build_col_map(specs: &[scylla::frame::response::result::ColumnSpec<'_>]) -> ColMap {
     specs
@@ -8198,13 +8214,12 @@ impl Storage for CqlStorage {
             _ => return Ok(false),
         };
 
-        let query = format!(
-            "UPDATE {}.consolidation_requests \
-             SET state = 'leased', lease_owner = ?, lease_expires_at = ?, \
-                 attempt_count = attempt_count + 1, last_error = null, completed_at = null \
-             WHERE tenant_id = ? AND session_id = ? IF {}",
-            self.keyspace, if_clause
-        );
+        let query = consolidation_claim_query(&self.keyspace, &if_clause);
+        // The row was just read, so the next attempt count is known here.
+        // Computing it client-side is what keeps the statement a plain
+        // conditional update; the `IF` is still what decides who wins the
+        // claim, so only one racer's value is ever written.
+        let next_attempt = existing.attempt_count.saturating_add(1);
         let result = if let Some(previous_expires_at) = extra_value {
             self.session
                 .query_unpaged(
@@ -8212,6 +8227,7 @@ impl Storage for CqlStorage {
                     (
                         lease_owner.to_string(),
                         lease_expires_at,
+                        next_attempt,
                         ctx.tenant_id,
                         session_id,
                         previous_expires_at,
@@ -8225,6 +8241,7 @@ impl Storage for CqlStorage {
                     (
                         lease_owner.to_string(),
                         lease_expires_at,
+                        next_attempt,
                         ctx.tenant_id,
                         session_id,
                     ),
@@ -8798,6 +8815,39 @@ mod cql_storage_tests {
             context_segment_bm25_candidate_limit(10) <= CONTEXT_SEGMENT_BM25_MAX_CANDIDATES,
             "candidate cap must remain bounded even for large top-k requests"
         );
+    }
+
+    #[test]
+    fn the_consolidation_claim_never_increments_a_counter_inside_a_conditional() {
+        // REGRESSION. `attempt_count = attempt_count + 1` inside an `IF`
+        // clause is a read-modify-write in a conditional update, which
+        // ferrosa refuses:
+        //
+        //   column 'attempt_count': unsupported collection assignment: Add of
+        //   a non-collection value — not supported inside a transaction
+        //   (BEGIN…COMMIT) or logged batch; use a non-transactional UPDATE
+        //
+        // Every claim failed for SEVEN DAYS — 8,012,510 of them — at a WARN
+        // nobody read. Consolidation was entirely dead, the queue never
+        // drained, and the sweep that reads it never stopped scanning.
+        for if_clause in [
+            "state = 'pending'",
+            "state = 'leased' AND lease_expires_at = ?",
+        ] {
+            let query = consolidation_claim_query("agent_memory", if_clause);
+            assert!(
+                query.contains(" IF "),
+                "the claim must stay conditional; the IF is what makes it a claim: {query}"
+            );
+            assert!(
+                !query.contains("attempt_count + 1"),
+                "a counter increment inside a conditional update is refused: {query}"
+            );
+            assert!(
+                query.contains("attempt_count = ?"),
+                "the next attempt count is computed by the caller and bound: {query}"
+            );
+        }
     }
 
     #[test]
