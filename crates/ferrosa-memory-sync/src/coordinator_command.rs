@@ -248,7 +248,6 @@ mod tests {
         assert_eq!(CoordinatorCommand::VmLaunch.effect(), Effect::Write);
     }
 
-
     #[test]
     fn hibernate_and_resume_arrive_as_coordinator_commands() {
         assert_eq!(
