@@ -258,6 +258,17 @@ impl ShellExtension {
                 "canonical_root": bounded_title(&alias.canonical_root),
             })
         }));
+        rows.extend(snapshot.registry.iter().map(|rule| {
+            serde_json::json!({
+                "row": "registry",
+                "id": bounded_title(&rule.entry.rule_id),
+                "name": bounded_title(&rule.entry.name),
+                "family": bounded_title(&rule.entry.family),
+                "state": rule.entry.state.to_string(),
+                "datalog": bounded_title(&rule.entry.rule_body),
+                "source": format!("{:?}", rule.source).to_lowercase(),
+            })
+        }));
 
         let mut frames = Self::page_frames("shell_rules", rows, true, None);
         if let Some(first) = frames.first_mut() {
@@ -356,10 +367,17 @@ impl ShellExtension {
                 })
             })
             .collect();
+        let grammar = ferrosa_memory_core::rule_palette::grammar();
         serde_json::json!({
             "type": "shell_rule_palette",
             "reachable": true,
             "blocks": blocks,
+            // Generic editors render this capability data; they do not embed
+            // the parser grammar. Curated blocks above remain the easy path.
+            "grammar": {
+                "version": grammar.version,
+                "operators": grammar.operators,
+            },
         })
     }
 

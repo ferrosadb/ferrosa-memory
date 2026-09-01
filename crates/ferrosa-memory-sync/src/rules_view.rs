@@ -23,6 +23,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ferrosa_memory_core::config::FerrosaCqlConfig;
+use ferrosa_memory_core::cql_storage::CqlStorage;
 use ferrosa_memory_core::rules_view::{
     DanglingAlias, TierRuleRow, dangling_aliases, tier_rule_rows,
 };
@@ -45,10 +47,14 @@ pub struct RuleYield {
 pub struct RulesSnapshot {
     pub rules: Vec<TierRuleRow>,
     pub dangling: Vec<DanglingAlias>,
+    /// Active, approved expert-system rules. These are a different population
+    /// from tier rules and must be shown as such rather than silently omitted.
+    pub registry: Vec<ferrosa_memory_core::datalog::EffectiveRuleEntry>,
 }
 
 pub struct RulesView {
     store: CqlTierStore,
+    registry_store: CqlStorage,
     ctx: TenantContext,
 }
 
@@ -77,8 +83,24 @@ impl RulesView {
         .map_err(|_| anyhow::anyhow!("rules store did not answer within 10s"))?
         .context("connecting to the rules store")?;
 
+        let session = Arc::new(session);
+        let registry_store = CqlStorage::connect(&FerrosaCqlConfig {
+            contact_points: contact_points.to_vec(),
+            keyspace: "agent_memory".into(),
+            replication_factor: 1,
+            consistency: "local_quorum".into(),
+            username: String::new(),
+            password: String::new(),
+            admin_username: None,
+            admin_password: None,
+            tls_ca_path: None,
+            tls_skip_hostname_verify: false,
+        })
+        .await
+        .context("connecting to the rule registry")?;
         Ok(Self {
-            store: CqlTierStore::new(Arc::new(session), "agent_memory"),
+            store: CqlTierStore::new(session, "agent_memory"),
+            registry_store,
             ctx: TenantContext {
                 tenant_id,
                 session_origin: "mobile-control".to_owned(),
@@ -103,9 +125,17 @@ impl RulesView {
             .await
             .context("reading the root aliases")?;
 
+        let registry = ferrosa_memory_core::datalog::load_effective_rule_entries(
+            &self.registry_store,
+            &self.ctx,
+            None,
+        )
+        .await
+        .context("reading active registry rules")?;
         Ok(RulesSnapshot {
             rules: tier_rule_rows(&rules, &aliases),
             dangling: dangling_aliases(&rules, &aliases),
+            registry,
         })
     }
 

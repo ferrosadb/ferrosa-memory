@@ -69,6 +69,113 @@ pub struct Block {
     pub negates: bool,
 }
 
+/// A versioned description of every operation the parser can understand.
+///
+/// This is capability data for generic editors, not a second grammar. Adding
+/// a parser variant must add a descriptor here, where the exhaustive matches
+/// make the omission a compile-time review point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grammar {
+    pub version: u32,
+    pub operators: Vec<GrammarOperator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrammarOperator {
+    pub id: String,
+    pub family: String,
+    pub label: String,
+    pub arity: usize,
+}
+
+/// The complete operator surface a generic client may render. Curated blocks
+/// remain the simple front door; this supports an editor that can grow without
+/// hard-coded mobile vocabulary.
+pub fn grammar() -> Grammar {
+    use crate::types::{AggregateKind as A, ArithOp, CmpOp, Func, StrOp};
+    let mut operators = vec![GrammarOperator {
+        id: "negation".into(),
+        family: "logic".into(),
+        label: "not".into(),
+        arity: 1,
+    }];
+    operators.extend(
+        [
+            (CmpOp::Eq, "eq", "equals"),
+            (CmpOp::Ne, "ne", "does not equal"),
+            (CmpOp::Lt, "lt", "is less than"),
+            (CmpOp::Le, "le", "is at most"),
+            (CmpOp::Gt, "gt", "is greater than"),
+            (CmpOp::Ge, "ge", "is at least"),
+        ]
+        .into_iter()
+        .map(|(op, id, label)| {
+            let _ = op;
+            GrammarOperator {
+                id: format!("comparison.{id}"),
+                family: "comparison".into(),
+                label: label.into(),
+                arity: 2,
+            }
+        }),
+    );
+    operators.extend(
+        [
+            (ArithOp::Add, "add", "add"),
+            (ArithOp::Sub, "sub", "subtract"),
+            (ArithOp::Mul, "mul", "multiply"),
+            (ArithOp::Div, "div", "divide"),
+            (ArithOp::Rem, "rem", "remainder"),
+            (ArithOp::Pow, "pow", "power"),
+        ]
+        .into_iter()
+        .map(|(op, id, label)| {
+            let _ = op;
+            GrammarOperator {
+                id: format!("arithmetic.{id}"),
+                family: "arithmetic".into(),
+                label: label.into(),
+                arity: 2,
+            }
+        }),
+    );
+    operators.extend(StrOp::ALL.into_iter().map(|op| GrammarOperator {
+        id: format!("string.{}", op.keyword()),
+        family: "string".into(),
+        label: op.keyword().replace("str_", "").replace('_', " "),
+        arity: 2,
+    }));
+    operators.extend(Func::ALL.into_iter().map(|func| GrammarOperator {
+        id: format!("function.{}", func.keyword()),
+        family: "function".into(),
+        label: func.keyword().into(),
+        arity: func.arity(),
+    }));
+    for kind in [
+        A::Count,
+        A::Sum,
+        A::Min,
+        A::Max,
+        A::Avg,
+        A::StdDev,
+        A::CountDistinct,
+        A::Median,
+        A::Percentile,
+        A::GroupConcat,
+    ] {
+        operators.push(GrammarOperator {
+            id: format!("aggregate.{}", kind.keyword()),
+            family: "aggregate".into(),
+            label: kind.keyword().replace('_', " "),
+            arity: usize::from(kind.needs_value_var()) + usize::from(kind.needs_param()),
+        });
+    }
+    Grammar {
+        version: 1,
+        operators,
+    }
+}
+
 /// A block, plus the machinery to compile and prove it.
 struct Definition {
     block: Block,
@@ -317,6 +424,56 @@ pub fn compile(placed: &[Placed]) -> Result<String, CompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The advertised grammar is a contract, not a second parser. Every
+    /// parser operator has one stable descriptor so generic clients can render
+    /// new capability without a client release.
+    #[test]
+    fn grammar_advertises_the_complete_operator_surface() {
+        let grammar = grammar();
+        assert_eq!(grammar.version, 1);
+        for id in [
+            "negation",
+            "comparison.eq",
+            "comparison.ne",
+            "comparison.lt",
+            "comparison.le",
+            "comparison.gt",
+            "comparison.ge",
+            "arithmetic.add",
+            "arithmetic.sub",
+            "arithmetic.mul",
+            "arithmetic.div",
+            "arithmetic.rem",
+            "arithmetic.pow",
+            "string.str_starts_with",
+            "string.str_ends_with",
+            "string.str_contains",
+            "aggregate.count",
+            "aggregate.sum",
+            "aggregate.min",
+            "aggregate.max",
+            "aggregate.avg",
+            "aggregate.stddev",
+            "aggregate.count_distinct",
+            "aggregate.median",
+            "aggregate.percentile",
+            "aggregate.group_concat",
+        ] {
+            assert!(
+                grammar.operators.iter().any(|operator| operator.id == id),
+                "missing {id}"
+            );
+        }
+        assert_eq!(
+            grammar
+                .operators
+                .iter()
+                .filter(|operator| operator.family == "function")
+                .count(),
+            14
+        );
+    }
 
     fn placed(id: &str, value: &str) -> Placed {
         Placed {

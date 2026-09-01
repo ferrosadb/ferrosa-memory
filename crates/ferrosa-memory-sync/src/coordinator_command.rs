@@ -26,6 +26,14 @@ pub enum CoordinatorCommand {
     SecretDeny,
     /// List running microVMs.
     VmList,
+    /// Report what this machine's coordinator can run: which runtime tiers are
+    /// live, what images it holds, and how much room is left.
+    ///
+    /// A read, and the one a controller issues before it can offer anything at
+    /// all. It is what replaced typing an address into the app: a coordinator
+    /// listens on loopback and is reached by the listener sitting beside it,
+    /// so nothing off the machine needs a port.
+    CoordinatorOffer,
 }
 
 /// What a command does to the world.
@@ -93,6 +101,7 @@ impl CoordinatorCommand {
             "secret_fulfil" => Some(Self::SecretFulfil),
             "secret_deny" => Some(Self::SecretDeny),
             "vm_list" => Some(Self::VmList),
+            "coordinator_offer" => Some(Self::CoordinatorOffer),
             _ => None,
         }
     }
@@ -105,13 +114,17 @@ impl CoordinatorCommand {
             Self::SecretFulfil => "secret_fulfil",
             Self::SecretDeny => "secret_deny",
             Self::VmList => "vm_list",
+            Self::CoordinatorOffer => "coordinator_offer",
         }
     }
 
     /// Whether this command changes anything.
     pub fn effect(self) -> Effect {
         match self {
-            Self::TeammateList | Self::SecretPendingList | Self::VmList => Effect::Read,
+            Self::TeammateList
+            | Self::SecretPendingList
+            | Self::VmList
+            | Self::CoordinatorOffer => Effect::Read,
             Self::SecretFulfil | Self::SecretDeny => Effect::Write,
         }
     }
@@ -421,5 +434,38 @@ mod dispatch_contract_tests {
         assert!(CoordinatorCommand::SecretFulfil.carries_secret());
         assert!(!CoordinatorCommand::SecretDeny.carries_secret());
         assert!(!CoordinatorCommand::TeammateList.carries_secret());
+    }
+}
+
+#[cfg(test)]
+mod coordinator_offer_tests {
+    use super::*;
+
+    /// The command a controller issues before it can offer anything at all.
+    #[test]
+    fn coordinator_offer_is_a_recognised_read() {
+        let cmd = CoordinatorCommand::from_wire("coordinator_offer").expect("recognised");
+        assert_eq!(cmd, CoordinatorCommand::CoordinatorOffer);
+        assert_eq!(cmd.as_wire(), "coordinator_offer");
+        // A read: asking what a machine can run must never change what it can.
+        assert_eq!(cmd.effect(), Effect::Read);
+    }
+
+    /// It carries no credential, so a caller logging frames may render it.
+    /// Getting this wrong in the other direction is what keeps secrets out of
+    /// logs, so the answer is asserted rather than assumed.
+    #[test]
+    fn coordinator_offer_carries_no_secret() {
+        assert!(!CoordinatorCommand::CoordinatorOffer.carries_secret());
+    }
+
+    /// It is a coordinator command like the others, and needs the same
+    /// capability. A peer without it must not learn what a machine can run.
+    #[test]
+    fn coordinator_offer_needs_the_coordinator_capability() {
+        assert_eq!(
+            CoordinatorCommand::CoordinatorOffer.required_capability(),
+            CoordinatorCommand::VmList.required_capability()
+        );
     }
 }

@@ -308,6 +308,19 @@ impl CoordinatorClient {
         self.get_json("/v1/vms").await
     }
 
+    /// What this machine can run: live tiers, images, and remaining capacity.
+    ///
+    /// Two calls rather than one, because a controller needs both and asking
+    /// twice over the control channel would double the round trips on the one
+    /// question every machine is asked. `/v1/setup` is best effort: a
+    /// coordinator older than that endpoint reports no setup, which is not the
+    /// same as a host that needs nothing and must not render as one.
+    pub async fn offering(&self) -> Result<serde_json::Value, CoordinatorError> {
+        let offering = self.get_json("/v1/offering").await?;
+        let setup = self.get_json("/v1/setup").await.ok();
+        Ok(serde_json::json!({ "offering": offering, "setup": setup }))
+    }
+
     /// Answer a secret request.
     ///
     /// The ONLY method that touches a secret. `value` is moved in, sent once,
