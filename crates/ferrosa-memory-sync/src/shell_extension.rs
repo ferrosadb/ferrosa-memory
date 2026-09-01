@@ -2,8 +2,8 @@
 //! Correctness: Correct when a device cannot run anything without a grant,
 //! when a config survives a restart of the machine, and when output reaches
 //! the device as it is produced rather than when the command finishes.
-//! Last revised: 2026-08-25
-//! Last changed: Adds bounded tenant-aware knowledge-tier frames.
+//! Last revised: 2026-08-31
+//! Last changed: Stages artifact uploads on disk and verifies them before persistence.
 //!
 //! # Three capabilities wearing one grant, for now
 //!
@@ -23,9 +23,11 @@
 //! precisely so swapping its body is the whole change.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio::fs::{self, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
 
 use crate::listener::{SessionExtension, SessionHandle};
@@ -77,6 +79,7 @@ pub struct ShellExtension {
 
 #[derive(Default)]
 struct ShellState {
+    controller_device_id: Option<uuid::Uuid>,
     granted: bool,
     open: Option<Arc<RunningSession>>,
     /// Pumps output to the device until the session ends.
@@ -89,17 +92,21 @@ struct ShellState {
     artifact_uploads: HashMap<uuid::Uuid, ArtifactUpload>,
 }
 
-/// One bounded, ordered byte stream being received over the control channel.
+/// One ordered byte stream being received over the control channel.
 ///
 /// The channel is reliable but retries are normal on a phone changing networks.
-/// Keeping exactly `next_index` means a replay can never append bytes twice and
-/// an out-of-order chunk cannot silently produce a different checksum.
+/// Keeping exactly `next_offset` means a replay can never append bytes twice and
+/// an out-of-order chunk cannot silently produce a different checksum. Payload
+/// bytes live in the staging file, not in this session state, so memory use is
+/// independent of the artifact's size.
 #[derive(Clone)]
 struct ArtifactUpload {
     declared_size: usize,
     declared_sha256: String,
     artifact_id: String,
-    bytes: Vec<u8>,
+    staging_path: PathBuf,
+    next_offset: usize,
+    completing: bool,
     name: String,
     media_type: String,
     uploader_id: String,
@@ -130,6 +137,35 @@ impl ShellExtension {
             knowledge: tokio::sync::OnceCell::new(),
             rules: tokio::sync::OnceCell::new(),
             artifacts: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Return the private staging path for one authenticated upload.
+    ///
+    /// The path is derived from the listener's config-store directory and a
+    /// UUID supplied through the control protocol, so it cannot escape the
+    /// listener's local staging area. Files are created with `create_new` at
+    /// begin time; an existing path is never adopted as a new upload.
+    fn artifact_staging_path(&self, upload_id: uuid::Uuid) -> PathBuf {
+        let directory = self
+            .store_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".ferrosa-artifact-uploads");
+        directory.join(format!("{upload_id}.part"))
+    }
+
+    /// Make a failed completion retryable without losing the verified staging
+    /// bytes. This is called only before the durable link is known to exist.
+    async fn reset_artifact_completion(&self, session_id: uuid::Uuid, upload_id: uuid::Uuid) {
+        if let Some(upload) = self
+            .sessions
+            .lock()
+            .await
+            .get_mut(&session_id)
+            .and_then(|state| state.artifact_uploads.get_mut(&upload_id))
+        {
+            upload.completing = false;
         }
     }
 
@@ -189,6 +225,97 @@ impl ShellExtension {
         }
     }
 
+    async fn artifact_review_queue_frame(
+        &self,
+        session_id: uuid::Uuid,
+        limit: i32,
+    ) -> serde_json::Value {
+        let reviewer_id = match self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|state| state.controller_device_id)
+        {
+            Some(id) => id.to_string(),
+            None => {
+                return serde_json::json!({
+                    "type": "artifact_review_queue",
+                    "reachable": false,
+                    "items": [],
+                    "reason": "artifact review session is not authenticated"
+                });
+            }
+        };
+        let Some(artifacts) = self.artifacts().await else {
+            return serde_json::json!({
+                "type": "artifact_review_queue",
+                "reachable": false,
+                "items": [],
+                "reason": "the artifact store could not be reached"
+            });
+        };
+        match artifacts.review_queue(&reviewer_id, limit).await {
+            Ok(items) => serde_json::json!({
+                "type": "artifact_review_queue",
+                "reachable": true,
+                "items": items.into_iter().map(|item| serde_json::json!({
+                    "id": item.artifact_id,
+                    "name": item.name,
+                    "status": item.state,
+                    "tags": item.tags,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(error) => serde_json::json!({
+                "type": "artifact_review_queue",
+                "reachable": false,
+                "items": [],
+                "reason": bounded_reason(error)
+            }),
+        }
+    }
+
+    async fn artifact_approve(
+        &self,
+        session_id: uuid::Uuid,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let artifact_id = body
+            .get("artifact_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "artifact approval needs artifact_id".to_owned())?;
+        let policy_expanding = body
+            .get("policy_expanding")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let policy_change = body
+            .get("policy_change")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let reviewer_id = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|state| state.controller_device_id)
+            .map(|id| id.to_string())
+            .ok_or_else(|| "artifact approval session is not authenticated".to_owned())?;
+        let artifacts = self
+            .artifacts()
+            .await
+            .ok_or_else(|| "the artifact store could not be reached".to_owned())?;
+        let activated = artifacts
+            .activate(artifact_id, &reviewer_id, policy_expanding, policy_change)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "type": "artifact_approve",
+            "accepted": activated,
+            "artifact_id": artifact_id,
+            "status": if activated { "active" } else { "pending" },
+        }))
+    }
+
     async fn artifact_upload_begin(
         &self,
         session_id: uuid::Uuid,
@@ -227,7 +354,6 @@ impl ShellExtension {
                 .unwrap_or(fallback)
                 .to_owned()
         };
-        let uploader_id = metadata_text("uploader_id", "mobile-control");
         let captured_path = metadata_text("captured_path", &name);
         let host_id = metadata_text("host_id", "mobile");
         let host_label = metadata_text("host_label", "Mobile");
@@ -252,27 +378,50 @@ impl ShellExtension {
         let state = sessions
             .get_mut(&session_id)
             .ok_or_else(|| "artifact upload session is not bound".to_owned())?;
+        let uploader_id = state
+            .controller_device_id
+            .map(|id| id.to_string())
+            .ok_or_else(|| "artifact upload session has no authenticated device".to_owned())?;
         if let Some(existing) = state.artifact_uploads.get(&upload_id) {
             if existing.declared_size != declared_size
                 || existing.declared_sha256 != declared_sha256
             {
                 return Err("artifact upload id is already in use for different content".to_owned());
             }
+            if existing.completing {
+                return Err(
+                    "artifact upload is completing; retry after it reports a result".to_owned(),
+                );
+            }
             return Ok(serde_json::json!({
                 "type": "artifact_upload_begin",
                 "accepted": true,
                 "request_id": request_id,
                 "upload_id": upload_id,
-                "next_offset": existing.bytes.len(),
+                "next_offset": existing.next_offset,
             }));
         }
+        let staging_path = self.artifact_staging_path(upload_id);
+        if let Some(directory) = staging_path.parent() {
+            fs::create_dir_all(directory)
+                .await
+                .map_err(|error| format!("could not create artifact staging directory: {error}"))?;
+        }
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .await
+            .map_err(|error| format!("could not create artifact staging file: {error}"))?;
         state.artifact_uploads.insert(
             upload_id,
             ArtifactUpload {
                 declared_size,
                 declared_sha256,
                 artifact_id: format!("a_{}", uuid::Uuid::now_v7().simple()),
-                bytes: Vec::new(),
+                staging_path,
+                next_offset: 0,
+                completing: false,
                 name,
                 media_type,
                 uploader_id,
@@ -342,27 +491,47 @@ impl ShellExtension {
             .artifact_uploads
             .get_mut(&upload_id)
             .ok_or_else(|| "artifact upload does not exist or is already complete".to_owned())?;
-        let next_offset = upload.bytes.len();
-        if offset > next_offset {
-            return Err(format!(
-                "artifact upload chunk offset {offset} is invalid; expected {next_offset}",
-            ));
+        if upload.completing {
+            return Err("artifact upload is completing; chunks are no longer accepted".to_owned());
         }
-        let end = offset
-            .checked_add(chunk.len())
-            .ok_or_else(|| "artifact upload size overflow".to_owned())?;
-        if end > upload.declared_size {
-            return Err(format!(
-                "artifact upload exceeds declared size {}",
-                upload.declared_size
-            ));
-        }
-        if offset < next_offset {
-            if end > next_offset || upload.bytes[offset..end] != chunk {
-                return Err("artifact upload retry does not match accepted chunk".to_owned());
+        let next_offset = upload.next_offset;
+        let disposition =
+            validate_artifact_chunk_window(next_offset, upload.declared_size, offset, chunk.len())?;
+        match disposition {
+            ArtifactChunkDisposition::Retry => {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .open(&upload.staging_path)
+                    .await
+                    .map_err(|error| format!("could not read artifact staging file: {error}"))?;
+                file.seek(SeekFrom::Start(offset as u64))
+                    .await
+                    .map_err(|error| format!("could not seek artifact staging file: {error}"))?;
+                let mut accepted = vec![0; chunk.len()];
+                file.read_exact(&mut accepted)
+                    .await
+                    .map_err(|error| format!("could not verify artifact retry: {error}"))?;
+                if accepted != chunk {
+                    return Err("artifact upload retry does not match accepted chunk".to_owned());
+                }
             }
-        } else {
-            upload.bytes.extend_from_slice(&chunk);
+            ArtifactChunkDisposition::Append { end } => {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(&upload.staging_path)
+                    .await
+                    .map_err(|error| format!("could not open artifact staging file: {error}"))?;
+                file.seek(SeekFrom::Start(offset as u64))
+                    .await
+                    .map_err(|error| format!("could not seek artifact staging file: {error}"))?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| format!("could not write artifact staging file: {error}"))?;
+                file.sync_data()
+                    .await
+                    .map_err(|error| format!("could not flush artifact staging file: {error}"))?;
+                upload.next_offset = end;
+            }
         }
         Ok(serde_json::json!({
             "type": "artifact_upload_chunk",
@@ -372,7 +541,7 @@ impl ShellExtension {
             "offset": offset,
             "byte_count": byte_count,
             "sha256": actual_sha256,
-            "next_offset": upload.bytes.len(),
+            "next_offset": upload.next_offset,
         }))
     }
 
@@ -381,8 +550,6 @@ impl ShellExtension {
         session_id: uuid::Uuid,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        use sha2_kdf::{Digest as _, Sha256};
-
         let request_id = request_id(body)?;
         let upload_id = upload_id(body)?;
         let expected_sha256 = sha256(body)?;
@@ -392,39 +559,66 @@ impl ShellExtension {
             .ok_or_else(|| "artifact upload complete needs size_bytes".to_owned())?;
         let declared_size = usize::try_from(declared_size)
             .map_err(|_| "artifact upload size is too large for this host".to_owned())?;
-        let mut sessions = self.sessions.lock().await;
-        let state = sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| "artifact upload session is not bound".to_owned())?;
-        let upload = state
-            .artifact_uploads
-            .get(&upload_id)
-            .ok_or_else(|| "artifact upload does not exist or is already complete".to_owned())?;
-        if declared_size != upload.declared_size || upload.bytes.len() != upload.declared_size {
-            return Err(format!(
-                "artifact upload is incomplete: received {} of {} bytes",
-                upload.bytes.len(),
-                upload.declared_size
-            ));
+        let staged = {
+            let mut sessions = self.sessions.lock().await;
+            let state = sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| "artifact upload session is not bound".to_owned())?;
+            let upload = state.artifact_uploads.get_mut(&upload_id).ok_or_else(|| {
+                "artifact upload does not exist or is already complete".to_owned()
+            })?;
+            if upload.completing {
+                return Err("artifact upload completion is already in progress".to_owned());
+            }
+            if declared_size != upload.declared_size || upload.next_offset != upload.declared_size {
+                return Err(format!(
+                    "artifact upload is incomplete: received {} of {} bytes",
+                    upload.next_offset, upload.declared_size
+                ));
+            }
+            upload.completing = true;
+            upload.clone()
+        };
+        let (size, checksum) = match checksum_staged_file(&staged.staging_path).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.reset_artifact_completion(session_id, upload_id).await;
+                return Err(error);
+            }
+        };
+        if size != declared_size
+            || expected_sha256 != staged.declared_sha256
+            || expected_sha256 != checksum
+        {
+            self.reset_artifact_completion(session_id, upload_id).await;
+            return Err(
+                "artifact upload checksum or size does not match completed staging file".to_owned(),
+            );
         }
-        let checksum = format!("{:x}", Sha256::digest(&upload.bytes));
-        if expected_sha256 != upload.declared_sha256 || expected_sha256 != checksum {
-            return Err("artifact upload checksum does not match completed bytes".to_owned());
-        }
-        let size = upload.bytes.len();
-        let artifact_id = upload.artifact_id.clone();
-        let staged = upload.clone();
-        drop(sessions);
-        let artifacts = self
-            .artifacts()
-            .await
-            .ok_or_else(|| "the artifact store could not be reached".to_owned())?;
-        artifacts
+        // CQL blob values are the final sink and currently require one owned
+        // value. The unbounded portion of the pipeline is already on disk and
+        // has been verified before this read; the control-session state never
+        // retains the artifact bytes.
+        let content = match fs::read(&staged.staging_path).await {
+            Ok(content) => content,
+            Err(error) => {
+                self.reset_artifact_completion(session_id, upload_id).await;
+                return Err(format!(
+                    "could not read verified artifact staging file: {error}"
+                ));
+            }
+        };
+        let artifacts = self.artifacts().await;
+        let Some(artifacts) = artifacts else {
+            self.reset_artifact_completion(session_id, upload_id).await;
+            return Err("the artifact store could not be reached".to_owned());
+        };
+        if let Err(error) = artifacts
             .persist_pending(&crate::artifact_view::StoredArtifact {
                 artifact_id: staged.artifact_id.clone(),
                 display_name: staged.name,
                 checksum: staged.declared_sha256.clone(),
-                bytes: staged.bytes,
+                bytes: content,
                 media_type: staged.media_type,
                 uploader_id: staged.uploader_id,
                 captured_path: staged.captured_path,
@@ -433,7 +627,16 @@ impl ShellExtension {
                 tags: staged.tags,
             })
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            self.reset_artifact_completion(session_id, upload_id).await;
+            return Err(error.to_string());
+        }
+        if let Err(error) = fs::remove_file(&staged.staging_path).await {
+            self.reset_artifact_completion(session_id, upload_id).await;
+            return Err(format!(
+                "could not remove completed artifact staging file: {error}"
+            ));
+        }
         let mut sessions = self.sessions.lock().await;
         let state = sessions
             .get_mut(&session_id)
@@ -442,6 +645,7 @@ impl ShellExtension {
         // verification. Removing it makes repeated completion unambiguously
         // fail instead of publishing the same staging payload twice.
         state.artifact_uploads.remove(&upload_id);
+        let artifact_id = staged.artifact_id;
         Ok(serde_json::json!({
             "type": "artifact_upload_complete",
             "accepted": true,
@@ -2641,6 +2845,8 @@ pub const SHELL_KINDS: &[&str] = &[
     "shell_artifact_upload_complete",
     "shell_artifact_files",
     "shell_artifact_detail",
+    "shell_artifact_review_queue",
+    "shell_artifact_approve",
     "shell_artifact_send_to_agent",
 ];
 
@@ -2653,10 +2859,13 @@ impl SessionExtension for ShellExtension {
     async fn on_bound(&self, session: &SessionHandle) -> Result<(), String> {
         // Registered, not granted. Binding a control session is not asking to
         // run commands on the machine.
-        self.sessions
-            .lock()
-            .await
-            .insert(session.session_id(), ShellState::default());
+        self.sessions.lock().await.insert(
+            session.session_id(),
+            ShellState {
+                controller_device_id: Some(session.controller_device_id()),
+                ..ShellState::default()
+            },
+        );
         Ok(())
     }
 
@@ -3168,6 +3377,24 @@ impl SessionExtension for ShellExtension {
                     .send(&envelope(self.artifact_detail_frame(id).await))
                     .await
             }
+            "shell_artifact_review_queue" => {
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(8) as i32;
+                session
+                    .send(&envelope(
+                        self.artifact_review_queue_frame(session_id, limit).await,
+                    ))
+                    .await
+            }
+            "shell_artifact_approve" => {
+                let reply = match self.artifact_approve(session_id, body).await {
+                    Ok(reply) => reply,
+                    Err(reason) => artifact_upload_rejection("artifact_approve", body, reason)?,
+                };
+                session.send(&envelope(reply)).await
+            }
             "shell_artifact_send_to_agent" => {
                 let id = body
                     .get("artifact_id")
@@ -3192,16 +3419,109 @@ impl SessionExtension for ShellExtension {
         // The status pump outlives an open session but not the control session.
         // Leaving it running would scrape tmux forever for a device that has
         // gone, which is invisible and never stops.
-        if let Some(state) = self.sessions.lock().await.get_mut(&session_id)
-            && let Some(pump) = state.status_pump.take()
-        {
-            pump.abort();
-        }
+        let staging_paths = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .get_mut(&session_id)
+                .map(|state| {
+                    if let Some(pump) = state.status_pump.take() {
+                        pump.abort();
+                    }
+                    state
+                        .artifact_uploads
+                        .drain()
+                        .map(|(_, upload)| upload.staging_path)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         self.close(session_id).await;
         // The grant goes with the session. An ephemeral session is killed by
         // dropping it; a tmux one keeps running, which is why it was chosen.
         self.sessions.lock().await.remove(&session_id);
+        for path in staging_paths {
+            if let Err(error) = fs::remove_file(path).await {
+                tracing::debug!(%error, "could not remove abandoned artifact staging file");
+            }
+        }
     }
+}
+
+/// The disk operation required for one validated chunk window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactChunkDisposition {
+    /// Compare the bytes already staged; a retry must not append them again.
+    Retry,
+    /// Write at the current end of the staging file and advance the offset.
+    Append { end: usize },
+}
+
+/// Validate chunk ordering and bounds before any staging-file I/O.
+///
+/// Invariants: offsets never skip bytes, checked arithmetic guards overflow,
+/// no nonterminal empty chunk can leave the client without progress, and the
+/// declared artifact size is never exceeded. Byte equality for retries is a
+/// separate disk check because it depends on the staged content.
+fn validate_artifact_chunk_window(
+    next_offset: usize,
+    declared_size: usize,
+    offset: usize,
+    chunk_len: usize,
+) -> Result<ArtifactChunkDisposition, String> {
+    if offset > next_offset {
+        return Err(format!(
+            "artifact upload chunk offset {offset} is invalid; expected {next_offset}"
+        ));
+    }
+    if chunk_len == 0 && offset == next_offset && next_offset < declared_size {
+        return Err("artifact upload chunk must make forward progress".to_owned());
+    }
+    let end = offset
+        .checked_add(chunk_len)
+        .ok_or_else(|| "artifact upload size overflow".to_owned())?;
+    if end > declared_size {
+        return Err(format!(
+            "artifact upload exceeds declared size {declared_size}"
+        ));
+    }
+    if offset < next_offset {
+        if end > next_offset {
+            return Err("artifact upload retry does not match accepted chunk".to_owned());
+        }
+        Ok(ArtifactChunkDisposition::Retry)
+    } else {
+        Ok(ArtifactChunkDisposition::Append { end })
+    }
+}
+
+/// Stream a completed upload from its private staging file into SHA-256.
+///
+/// The buffer is fixed at 64 KiB, so checksum memory is independent of the
+/// artifact size. The caller must compare both returned values with the
+/// protocol declarations before handing the file to the durable artifact
+/// store.
+async fn checksum_staged_file(path: &Path) -> Result<(usize, String), String> {
+    use sha2_kdf::{Digest as _, Sha256};
+
+    let mut file = fs::File::open(path)
+        .await
+        .map_err(|error| format!("could not open artifact staging file for checksum: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut size = 0usize;
+    loop {
+        let read = file.read(&mut buffer).await.map_err(|error| {
+            format!("could not read artifact staging file for checksum: {error}")
+        })?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read)
+            .ok_or_else(|| "artifact size overflow while checking checksum".to_owned())?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((size, format!("{:x}", hasher.finalize())))
 }
 
 fn config_id(body: &serde_json::Value) -> Result<uuid::Uuid, String> {
@@ -3421,11 +3741,13 @@ mod tests {
     async fn artifact_upload_accepts_each_chunk_once_and_requires_durable_store() {
         let extension = ShellExtension::new(std::env::temp_dir(), store(), Vec::new(), None);
         let session_id = uuid::Uuid::now_v7();
-        extension
-            .sessions
-            .lock()
-            .await
-            .insert(session_id, ShellState::default());
+        extension.sessions.lock().await.insert(
+            session_id,
+            ShellState {
+                controller_device_id: Some(uuid::Uuid::now_v7()),
+                ..ShellState::default()
+            },
+        );
 
         let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let client_upload_id = uuid::Uuid::now_v7();
@@ -3495,14 +3817,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_upload_binds_uploader_to_the_authenticated_controller() {
+        let extension = ShellExtension::new(std::env::temp_dir(), store(), Vec::new(), None);
+        let session_id = uuid::Uuid::now_v7();
+        let device_id = uuid::Uuid::now_v7();
+        extension.sessions.lock().await.insert(
+            session_id,
+            ShellState {
+                controller_device_id: Some(device_id),
+                ..ShellState::default()
+            },
+        );
+        extension
+            .artifact_upload_begin(
+                session_id,
+                &serde_json::json!({
+                    "request_id": "begin-bound-identity",
+                    "upload_id": uuid::Uuid::now_v7(),
+                    "size_bytes": 0,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "metadata": {"uploader_id": "attacker-controlled"}
+                }),
+            )
+            .await
+            .expect("begin");
+        let sessions = extension.sessions.lock().await;
+        let upload = sessions
+            .get(&session_id)
+            .and_then(|state| state.artifact_uploads.values().next())
+            .expect("staged upload");
+        assert_eq!(upload.uploader_id, device_id.to_string());
+    }
+
+    #[tokio::test]
     async fn artifact_upload_rejects_oversize_and_incomplete_payloads() {
         let extension = ShellExtension::new(std::env::temp_dir(), store(), Vec::new(), None);
         let session_id = uuid::Uuid::now_v7();
-        extension
-            .sessions
-            .lock()
-            .await
-            .insert(session_id, ShellState::default());
+        extension.sessions.lock().await.insert(
+            session_id,
+            ShellState {
+                controller_device_id: Some(uuid::Uuid::now_v7()),
+                ..ShellState::default()
+            },
+        );
         let digest = "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7c9b7f11f0e1e2c";
         let started = extension
             .artifact_upload_begin(
@@ -3551,14 +3908,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_upload_stages_large_payloads_without_buffering_them_in_memory() {
+        let extension = ShellExtension::new(std::env::temp_dir(), store(), Vec::new(), None);
+        let session_id = uuid::Uuid::now_v7();
+        extension.sessions.lock().await.insert(
+            session_id,
+            ShellState {
+                controller_device_id: Some(uuid::Uuid::now_v7()),
+                ..ShellState::default()
+            },
+        );
+
+        extension
+            .artifact_upload_begin(
+                session_id,
+                &serde_json::json!({
+                    "request_id": "begin-large-staged",
+                    "upload_id": uuid::Uuid::now_v7(),
+                    "size_bytes": 1_000_000_000,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                }),
+            )
+            .await
+            .expect("begin");
+        let sessions = extension.sessions.lock().await;
+        let upload = sessions
+            .get(&session_id)
+            .and_then(|state| state.artifact_uploads.values().next())
+            .expect("staged upload");
+        assert_eq!(upload.next_offset, 0);
+        assert!(upload.staging_path.exists());
+        let staging_path = upload.staging_path.clone();
+        drop(sessions);
+        fs::remove_file(staging_path)
+            .await
+            .expect("cleanup staging file");
+    }
+
+    #[tokio::test]
     async fn artifact_upload_accepts_a_full_mobile_chunk() {
         let extension = ShellExtension::new(std::env::temp_dir(), store(), Vec::new(), None);
         let session_id = uuid::Uuid::now_v7();
-        extension
-            .sessions
-            .lock()
-            .await
-            .insert(session_id, ShellState::default());
+        extension.sessions.lock().await.insert(
+            session_id,
+            ShellState {
+                controller_device_id: Some(uuid::Uuid::now_v7()),
+                ..ShellState::default()
+            },
+        );
         let data = vec![0x5a; MAX_ARTIFACT_UPLOAD_CHUNK_BYTES];
         let digest = sha256_hex(&data);
         let started = extension
@@ -3588,6 +3985,139 @@ mod tests {
             .await
             .expect("full mobile chunk");
         assert_eq!(ack["next_offset"], MAX_ARTIFACT_UPLOAD_CHUNK_BYTES);
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_retries_and_appends_against_the_disk_stage() {
+        let extension = ShellExtension::new(std::env::temp_dir(), store(), Vec::new(), None);
+        let session_id = uuid::Uuid::now_v7();
+        extension.sessions.lock().await.insert(
+            session_id,
+            ShellState {
+                controller_device_id: Some(uuid::Uuid::now_v7()),
+                ..ShellState::default()
+            },
+        );
+        let upload_id = uuid::Uuid::now_v7();
+        let digest = sha256_hex(b"abcdef");
+        extension
+            .artifact_upload_begin(
+                session_id,
+                &serde_json::json!({
+                    "request_id": "begin-disk-stage",
+                    "upload_id": upload_id,
+                    "size_bytes": 6,
+                    "sha256": digest,
+                }),
+            )
+            .await
+            .expect("begin");
+
+        let first = serde_json::json!({
+            "request_id": "chunk-first",
+            "upload_id": upload_id,
+            "offset": 0,
+            "byte_count": 3,
+            "sha256": sha256_hex(b"abc"),
+            "data": base64::engine::general_purpose::STANDARD.encode(b"abc"),
+        });
+        extension
+            .artifact_upload_chunk(session_id, &first)
+            .await
+            .expect("first chunk");
+        extension
+            .artifact_upload_chunk(session_id, &first)
+            .await
+            .expect("idempotent retry");
+
+        let second = serde_json::json!({
+            "request_id": "chunk-second",
+            "upload_id": upload_id,
+            "offset": 3,
+            "byte_count": 3,
+            "sha256": sha256_hex(b"def"),
+            "data": base64::engine::general_purpose::STANDARD.encode(b"def"),
+        });
+        extension
+            .artifact_upload_chunk(session_id, &second)
+            .await
+            .expect("second chunk");
+
+        let staging_path = extension
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .and_then(|state| state.artifact_uploads.get(&upload_id))
+            .map(|upload| upload.staging_path.clone())
+            .expect("staging path");
+        assert_eq!(
+            fs::read(&staging_path).await.expect("staged bytes"),
+            b"abcdef"
+        );
+        assert_eq!(
+            extension
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .and_then(|state| state.artifact_uploads.get(&upload_id))
+                .map(|upload| upload.next_offset),
+            Some(6)
+        );
+        extension.on_closed(session_id).await;
+        assert!(
+            !staging_path.exists(),
+            "closed sessions must not leak stages"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_checksum_streams_the_stage_in_fixed_size_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrosa-artifact-checksum-{}.part",
+            uuid::Uuid::now_v7()
+        ));
+        let mut file = fs::File::create(&path)
+            .await
+            .expect("create checksum fixture");
+        let first = vec![0x11; 64 * 1024];
+        let second = vec![0x22; 64 * 1024 + 17];
+        file.write_all(&first)
+            .await
+            .expect("write first fixture chunk");
+        file.write_all(&second)
+            .await
+            .expect("write second fixture chunk");
+        file.sync_all().await.expect("flush checksum fixture");
+        drop(file);
+
+        let (size, checksum) = checksum_staged_file(&path).await.expect("checksum");
+        assert_eq!(size, first.len() + second.len());
+        assert_eq!(checksum, sha256_hex(&[first, second].concat()));
+        fs::remove_file(path)
+            .await
+            .expect("cleanup checksum fixture");
+    }
+
+    #[test]
+    fn artifact_chunk_window_rejects_gaps_without_touching_the_stage() {
+        assert_eq!(
+            validate_artifact_chunk_window(3, 6, 4, 1),
+            Err("artifact upload chunk offset 4 is invalid; expected 3".to_owned())
+        );
+    }
+
+    #[test]
+    fn artifact_chunk_window_requires_progress_until_the_declared_end() {
+        assert_eq!(
+            validate_artifact_chunk_window(3, 6, 3, 0),
+            Err("artifact upload chunk must make forward progress".to_owned())
+        );
+        assert_eq!(
+            validate_artifact_chunk_window(6, 6, 6, 0),
+            Ok(ArtifactChunkDisposition::Append { end: 6 })
+        );
     }
 
     /// Editing an agent from a client too old to know about working
@@ -3755,6 +4285,8 @@ mod output_framing_tests {
         ("artifact_upload_complete", Sizing::Bounded),
         ("artifact_files", Sizing::Paged),
         ("artifact_detail", Sizing::Bounded),
+        ("artifact_review_queue", Sizing::Paged),
+        ("artifact_approve", Sizing::Bounded),
         ("artifact_sent_to_agent", Sizing::Bounded),
     ];
 

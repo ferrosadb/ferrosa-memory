@@ -260,6 +260,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "durable display names for artifact links",
         ddl: include_str!("../../../ddl/059_memory_artifact_display_name.cql"),
     },
+    Migration {
+        version: 60,
+        description: "explicit tenant reviewers for artifact policy decisions",
+        ddl: include_str!("../../../ddl/060_memory_artifact_reviewers.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

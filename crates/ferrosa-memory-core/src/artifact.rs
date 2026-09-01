@@ -2,8 +2,8 @@
 //! Correctness: Correct when every artifact has a stable `a_` identity, user
 //! tags normalize consistently, reserved system tags cannot be forged, and a
 //! pending artifact cannot be activated without its required policy decision.
-//! Last revised: 2026-08-30
-//! Last changed: Added the artifact domain model and tag/state invariants.
+//! Last revised: 2026-08-31
+//! Last changed: Added policy-gated activation decisions for artifact links.
 
 use std::collections::BTreeSet;
 
@@ -85,6 +85,43 @@ pub enum ArtifactState {
     Pending,
     Active,
     Deleted,
+}
+
+/// The authorization failure that prevents a pending link from becoming
+/// readable. The caller must distinguish a missing policy-change grant from a
+/// reviewer who is not in the tenant's reviewer set so it can build the right
+/// queue entry without leaking the artifact bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationError {
+    NotPending,
+    ReviewerNotAuthorized,
+    PolicyChangeRequired,
+}
+
+/// Determines whether a reviewer may activate a pending artifact link.
+///
+/// The uploader is allowed to approve a normal classification decision. A
+/// policy-expanding decision requires an authorized reviewer and an explicit
+/// `policy_change` grant; it is never implied by the artifact's tags.
+pub fn activation_allowed(
+    state: ArtifactState,
+    uploader_id: &str,
+    reviewer_id: &str,
+    authorized_reviewers: &BTreeSet<String>,
+    expands_policy: bool,
+    policy_change: bool,
+) -> Result<(), ActivationError> {
+    if state != ArtifactState::Pending {
+        return Err(ActivationError::NotPending);
+    }
+    let authorized = reviewer_id == uploader_id || authorized_reviewers.contains(reviewer_id);
+    if !authorized {
+        return Err(ActivationError::ReviewerNotAuthorized);
+    }
+    if expands_policy && !policy_change {
+        return Err(ActivationError::PolicyChangeRequired);
+    }
+    Ok(())
 }
 
 /// The minimum durable semantic record for a content-addressed artifact link.
@@ -186,5 +223,59 @@ mod tests {
                 .any(|tag| tag.as_str() == SystemTag::PENDING)
         );
         assert!(!artifact.activate());
+    }
+
+    #[test]
+    fn normal_activation_allows_the_uploader_but_policy_expansion_requires_explicit_grant() {
+        let reviewers = BTreeSet::new();
+        assert!(
+            activation_allowed(
+                ArtifactState::Pending,
+                "device-a",
+                "device-a",
+                &reviewers,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            activation_allowed(
+                ArtifactState::Pending,
+                "device-a",
+                "device-a",
+                &reviewers,
+                true,
+                false,
+            ),
+            Err(ActivationError::PolicyChangeRequired)
+        );
+        assert!(
+            activation_allowed(
+                ArtifactState::Pending,
+                "device-a",
+                "device-a",
+                &reviewers,
+                true,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn activation_rejects_an_unlisted_reviewer_without_exposing_content() {
+        let reviewers = BTreeSet::from(["reviewer-a".to_owned()]);
+        assert_eq!(
+            activation_allowed(
+                ArtifactState::Pending,
+                "device-a",
+                "reviewer-b",
+                &reviewers,
+                false,
+                false,
+            ),
+            Err(ActivationError::ReviewerNotAuthorized)
+        );
     }
 }
