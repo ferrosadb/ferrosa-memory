@@ -13,7 +13,7 @@
 //! baseline (version 19) so only migration 20 and later execute.
 //!
 //! "Genuinely predates versioning" is decided from the schema, not from the
-//! keyspace merely existing — see [`ensure_bootstrap_complete`]. The keyspace
+//! keyspace merely existing — see `ensure_bootstrap_complete`. The keyspace
 //! existing proves only that `ddl/001_keyspace.cql` ran; a first run killed
 //! partway through leaves a half-created keyspace that must be *resumed*, not
 //! adopted. Adoption is only legitimate when every table in
@@ -468,7 +468,7 @@ pub enum ResumeAction {
 
 /// Decide what a resume does with one statement, given whether its target
 /// already holds rows. Pure and testable; the caller supplies the liveness
-/// answer via [`table_nonempty`].
+/// answer via `table_nonempty`.
 ///
 /// `ddl/008_intentions_repo_scope.cql` opens with `DROP TABLE IF EXISTS
 /// intentions`. On the case this path exists for — a first run killed partway
