@@ -1360,6 +1360,9 @@ where
                 coordinator.pending_secrets().await
             }
             crate::coordinator_command::CoordinatorCommand::VmList => coordinator.vms().await,
+            crate::coordinator_command::CoordinatorCommand::CoordinatorOffer => {
+                coordinator.offering().await
+            }
             crate::coordinator_command::CoordinatorCommand::SecretFulfil => {
                 let request_id = payload
                     .get("request_id")

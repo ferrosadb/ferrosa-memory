@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The control-channel command vocabulary, shared with the app so the two
+# cannot spell a command differently. A path dependency, not a pinned rev:
+# these are all ours and a pin would be a second place to bump.
+ferrosa-control-vocabulary = { path = "../ferrosa-control-vocabulary" }
 # Terminal output is raw bytes — escape sequences, and whatever encoding the
 # program chose. JSON strings cannot carry that, and lossy UTF-8 conversion
 # would corrupt exactly the control sequences the emulator needs.
