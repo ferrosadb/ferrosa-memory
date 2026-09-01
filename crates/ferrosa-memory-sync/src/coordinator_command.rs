@@ -34,6 +34,8 @@ pub enum CoordinatorCommand {
     /// on loopback and is reached by the listener beside it, so nothing off the
     /// machine needs a port.
     CoordinatorOffer,
+    /// Start a microVM from an image the machine advertised.
+    VmLaunch,
     /// Write a running microVM to disk and stop it.
     VmHibernate,
     /// Wake a hibernated microVM from its snapshot.
@@ -111,6 +113,7 @@ impl CoordinatorCommand {
             ferrosa_control_vocabulary::Command::SecretDeny => Some(Self::SecretDeny),
             ferrosa_control_vocabulary::Command::VmList => Some(Self::VmList),
             ferrosa_control_vocabulary::Command::CoordinatorOffer => Some(Self::CoordinatorOffer),
+            ferrosa_control_vocabulary::Command::VmLaunch => Some(Self::VmLaunch),
             ferrosa_control_vocabulary::Command::VmHibernate => Some(Self::VmHibernate),
             ferrosa_control_vocabulary::Command::VmResume => Some(Self::VmResume),
             // Not a coordinator command, or not one this build knows. `None`
@@ -128,6 +131,7 @@ impl CoordinatorCommand {
             Self::SecretDeny => ferrosa_control_vocabulary::Command::SecretDeny,
             Self::VmList => ferrosa_control_vocabulary::Command::VmList,
             Self::CoordinatorOffer => ferrosa_control_vocabulary::Command::CoordinatorOffer,
+            Self::VmLaunch => ferrosa_control_vocabulary::Command::VmLaunch,
             Self::VmHibernate => ferrosa_control_vocabulary::Command::VmHibernate,
             Self::VmResume => ferrosa_control_vocabulary::Command::VmResume,
         }
@@ -145,6 +149,7 @@ impl CoordinatorCommand {
             ferrosa_control_vocabulary::Command::SecretDeny => "secret_deny",
             ferrosa_control_vocabulary::Command::VmList => "vm_list",
             ferrosa_control_vocabulary::Command::CoordinatorOffer => "coordinator_offer",
+            ferrosa_control_vocabulary::Command::VmLaunch => "vm_launch",
             ferrosa_control_vocabulary::Command::VmHibernate => "vm_hibernate",
             ferrosa_control_vocabulary::Command::VmResume => "vm_resume",
             _ => unreachable!("shared() only returns coordinator commands"),
@@ -233,6 +238,15 @@ pub fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launching_arrives_as_a_coordinator_write() {
+        assert_eq!(
+            CoordinatorCommand::from_wire("vm_launch"),
+            Some(CoordinatorCommand::VmLaunch)
+        );
+        assert_eq!(CoordinatorCommand::VmLaunch.effect(), Effect::Write);
+    }
 
     #[test]
     fn hibernate_and_resume_arrive_as_coordinator_commands() {
