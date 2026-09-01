@@ -363,6 +363,30 @@ impl CoordinatorClient {
     }
 
 
+
+    /// Start a microVM from an image this machine advertised.
+    ///
+    /// The body is passed through VERBATIM. It was built by shared Rust on the
+    /// controller from the same offering this coordinator published, and
+    /// rewriting it here would give the two sides two different ideas of what
+    /// was asked for. The coordinator validates it again regardless -- it does
+    /// not trust the controller's copy either.
+    pub async fn launch_vm(&self, body: &str) -> Result<serde_json::Value, CoordinatorError> {
+        // Parsed only to reject a malformed body before a round trip; the
+        // original text is what gets sent.
+        let _: serde_json::Value =
+            serde_json::from_str(body).map_err(|e| CoordinatorError::Malformed(e.to_string()))?;
+        let reply = self
+            .send(
+                self.http
+                    .post(self.url("/v1/launch"))
+                    .header("content-type", "application/json")
+                    .body(body.to_owned()),
+            )
+            .await?;
+        serde_json::from_str(&reply).map_err(|e| CoordinatorError::Malformed(e.to_string()))
+    }
+
     /// Write a running microVM to disk and stop it.
     ///
     /// Returns what the coordinator wrote -- both paths and the memory file's

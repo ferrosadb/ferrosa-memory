@@ -1360,6 +1360,15 @@ where
                 coordinator.pending_secrets().await
             }
             crate::coordinator_command::CoordinatorCommand::VmList => coordinator.vms().await,
+            crate::coordinator_command::CoordinatorCommand::VmLaunch => {
+                // The whole payload is the request, built on the controller
+                // from this machine's own offering. Forwarded rather than
+                // rebuilt so both ends agree on what was asked for.
+                let body = serde_json::to_string(&payload).map_err(|e| {
+                    ControlSessionError::Protocol(format!("vm_launch payload: {e}"))
+                })?;
+                coordinator.launch_vm(&body).await
+            }
             crate::coordinator_command::CoordinatorCommand::VmHibernate => {
                 let id = payload
                     .get("id")
