@@ -26,6 +26,7 @@
 //! interfaces. The fingerprint binding is real today; only the *source* (DTLS
 //! vouch) is deferred.
 
+pub mod artifact_view;
 pub mod codex_runtime;
 #[cfg(feature = "webrtc-transport")]
 pub mod control_session;

@@ -255,6 +255,26 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "reconcile note-share trust tables on keyspaces past the original feature migration",
         ddl: include_str!("../../../ddl/060_note_share_trust_reconcile.cql"),
     },
+    Migration {
+        version: 61,
+        description: "policy-governed artifact links, tags, approval records, and opaque content blobs",
+        ddl: include_str!("../../../ddl/061_memory_artifacts.cql"),
+    },
+    Migration {
+        version: 62,
+        description: "durable bytes for globally content-addressed artifact blobs",
+        ddl: include_str!("../../../ddl/062_memory_artifact_blob_content.cql"),
+    },
+    Migration {
+        version: 63,
+        description: "durable display names for artifact links",
+        ddl: include_str!("../../../ddl/063_memory_artifact_display_name.cql"),
+    },
+    Migration {
+        version: 64,
+        description: "explicit tenant reviewers for artifact policy decisions",
+        ddl: include_str!("../../../ddl/064_memory_artifact_reviewers.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

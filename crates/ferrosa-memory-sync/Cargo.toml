@@ -53,7 +53,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 
 [features]
 # Pulls the webrtc-rs ICE/DTLS/SCTP/SRTP stack and enables the concrete
-# `peer_transport::webrtc` channel. Off by default to keep non-P2P builds light.
+# `peer_transport::webrtc` channel. Enabled by default because the
+# `memory-sync` binary's control-listen command requires it.
+default = ["webrtc-transport"]
 webrtc-transport = ["dep:webrtc", "dep:bytes", "dep:reqwest", "dep:x25519-dalek", "dep:rustls"]
 
 [lib]

@@ -218,6 +218,7 @@ pub trait SessionExtension: Send + Sync {
 #[derive(Clone)]
 pub struct SessionHandle {
     session_id: uuid::Uuid,
+    controller_device_id: uuid::Uuid,
     peer: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
     sink: crate::control_session::ControlFrameSink,
 }
@@ -226,6 +227,13 @@ impl SessionHandle {
     /// Which session this is.
     pub fn session_id(&self) -> uuid::Uuid {
         self.session_id
+    }
+
+    /// The controller device authenticated by the broker for this session.
+    /// Extensions use this as the stable actor identity for writes; request
+    /// bodies must not be allowed to replace it.
+    pub fn controller_device_id(&self) -> uuid::Uuid {
+        self.controller_device_id
     }
 
     /// The peer connection, for attaching what this crate does not model.
@@ -550,6 +558,7 @@ async fn serve_control_session<S, R, T>(
     let peer_state = watch_peer_state(&channel.peer_connection());
     let handle = SessionHandle {
         session_id: offer.session_id,
+        controller_device_id: offer.controller_device_id,
         peer: channel.peer_connection(),
         sink: channel.frame_sink(),
     };
