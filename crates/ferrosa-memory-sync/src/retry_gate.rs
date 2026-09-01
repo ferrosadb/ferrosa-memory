@@ -23,7 +23,7 @@
 //! waits." A connect attempt costs up to ten seconds, so retrying on every
 //! frame would make a down cluster hang every screen that touches it.
 //!
-//! So: retry, but no more often than [`RETRY_INTERVAL`]. Between attempts the
+//! So: retry, but no more often than [`crate::retry_gate::RETRY_INTERVAL`]. Between
 //! answer is an immediate `None`, which is the same speed the cache gave and
 //! stops being permanent.
 //!
@@ -38,7 +38,7 @@
 //! The four dependencies had four copy-pasted `get_or_init` blocks differing
 //! only in type, connect call and log wording — which is why they all had the
 //! same bug and why fixing it four times would have been the wrong shape.
-//! [`ClusterView`] is the single concept: a cluster connection made on first
+//! [`crate::retry_gate::ClusterView`] is the single concept: a cluster connection
 //! use, kept once it works, retried when it does not, and loud at both edges.
 //! Each dependency is now one field and one call.
 
