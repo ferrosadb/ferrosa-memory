@@ -824,6 +824,44 @@ fn entity_tools(entity_type_enum: &Value) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "note_share_create".into(),
+            description: "Create an owner-authoritative, read-only note share. The recipient account is bound at creation; shares default to seven days and cannot be re-shared. Only a frozen summary is copied; live notes stay on the owner server.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "note_id": { "type": "string" },
+                    "recipient_account_id": { "type": "string" },
+                    "expires_at": { "type": "string", "format": "date-time" },
+                    "successful_read_limit": { "type": "integer", "minimum": 1 },
+                    "frozen_summary": { "type": "string", "maxLength": 65536 }
+                },
+                "required": ["note_id", "recipient_account_id"]
+            }),
+        },
+        ToolDef {
+            name: "note_share_read".into(),
+            description: "Read a note through an accepted share. Authorization, expiry, revocation, and the successful-read budget are checked on the owner server; a budget is consumed only after the content is delivered.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "share_id": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "entitlement": { "type": "object", "description": "Owner-signed NoteShareEntitlement envelope returned after activation acceptance" },
+                    "owner_public_identity": { "type": "object", "description": "Owner instance public identity used to verify the entitlement" }
+                },
+                "required": ["share_id"]
+            }),
+        },
+        ToolDef {
+            name: "note_share_revoke".into(),
+            description: "Immediately revoke a note share. Only the account that created the share can revoke it.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "share_id": { "type": "string" } },
+                "required": ["share_id"]
+            }),
+        },
+        ToolDef {
             name: "list_entities".into(),
             description: "List entities with structured equality predicates over entity fields and properties. Use this for kanban/task-style queries such as all task entities with status=ready and assignee=claude; use hybrid_search for semantic recall.".into(),
             input_schema: serde_json::json!({

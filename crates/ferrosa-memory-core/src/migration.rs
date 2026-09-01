@@ -245,6 +245,16 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "knowledge items, their version chain, and the queues that read them",
         ddl: include_str!("../../../ddl/056_knowledge_items.cql"),
     },
+    Migration {
+        version: 57,
+        description: "owner-authoritative opaque note-share entitlements and read audit",
+        ddl: include_str!("../../../ddl/057_note_share_trust.cql"),
+    },
+    Migration {
+        version: 60,
+        description: "reconcile note-share trust tables on keyspaces past the original feature migration",
+        ddl: include_str!("../../../ddl/060_note_share_trust_reconcile.cql"),
+    },
 ];
 
 /// `ddl/011_warmth_field.cql` — the `entity_warmth` table + session index.

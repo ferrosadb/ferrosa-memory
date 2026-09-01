@@ -1314,6 +1314,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "batch_ingest" => Box::pin(handle_batch_ingest(args, storage, ctx, session)),
         "ingest_entities" => Box::pin(handle_ingest_entities(args, storage, ctx, session)),
         "retrieve_entities" => Box::pin(handle_retrieve_entities(args, storage, ctx, session)),
+        "note_share_create" => Box::pin(handle_note_share_create(args, storage, ctx)),
+        "note_share_read" => Box::pin(handle_note_share_read(args, storage, ctx, session)),
+        "note_share_revoke" => Box::pin(handle_note_share_revoke(args, storage, ctx)),
         "list_entities" => Box::pin(handle_list_entities(args, storage, ctx)),
         "record_outcome" => Box::pin(handle_record_outcome(args, storage, ctx)),
         "record_feedback" | "record_last_retrieval_feedback" => {
@@ -1595,6 +1598,7 @@ fn is_tier1(name: &str) -> bool {
             | "session_task_observe"
             | "get_stats"
             | "retrieve_entities"
+            | "note_share_read"
             | "list_entities"
             | "forget"
     )
@@ -1641,6 +1645,8 @@ fn is_write_tool(name: &str) -> bool {
             | "batch_update_entities"
             | "batch_delete_entities"
             | "enrich_entities"
+            | "note_share_create"
+            | "note_share_revoke"
     )
 }
 
@@ -4455,6 +4461,192 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         })
         .collect();
     serde_json::to_value(&slim).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteShareCreateArgs {
+    note_id: uuid::Uuid,
+    recipient_account_id: uuid::Uuid,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    successful_read_limit: Option<u32>,
+    frozen_summary: Option<String>,
+}
+
+async fn handle_note_share_create<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: NoteShareCreateArgs = serde_json::from_value(args)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid note share: {e}")))?;
+    let expires_at = request
+        .expires_at
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(7));
+    if expires_at <= chrono::Utc::now() {
+        return Err((INVALID_PARAMS, "expires_at must be in the future".into()));
+    }
+    let content = request
+        .frozen_summary
+        .map(crate::note_share::NoteShareContent::FrozenSummary)
+        .unwrap_or(crate::note_share::NoteShareContent::LiveNote);
+    let share_id = uuid::Uuid::new_v4();
+    let share = crate::note_share::NoteShare::new(
+        share_id,
+        request.note_id,
+        request.recipient_account_id,
+        content,
+        match request.successful_read_limit {
+            Some(limit) => crate::note_share::NoteSharePolicy::with_read_limit(expires_at, limit),
+            None => crate::note_share::NoteSharePolicy::expires_at(expires_at),
+        },
+    );
+    if storage.note_share_persistence_enabled() {
+        storage
+            .note_share_persist(ctx.tenant_id, &share)
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("persist note share: {error}")))?;
+    }
+    crate::note_share::global_ledger()
+        .lock()
+        .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?
+        .insert(ctx.tenant_id, share)
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(serde_json::json!({
+        "share_id": share_id,
+        "note_id": request.note_id,
+        "recipient_account_id": request.recipient_account_id,
+        "expires_at": expires_at,
+        "read_only": true,
+        "re_share_allowed": false,
+    }))
+}
+
+async fn handle_note_share_read<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let share_id = require_uuid(&args, "share_id")?;
+    let now = chrono::Utc::now();
+    if storage.note_share_persistence_enabled()
+        && let Some((owner, share)) = storage
+            .note_share_load(share_id)
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("load note share: {error}")))?
+    {
+        let mut ledger = crate::note_share::global_ledger()
+            .lock()
+            .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?;
+        ledger.replace(owner, share);
+    }
+    let (content, attempt, owner_account_id, note_id) = {
+        let mut ledger = crate::note_share::global_ledger()
+            .lock()
+            .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?;
+        let record = ledger
+            .record(share_id)
+            .ok_or((INVALID_PARAMS, "unknown note share".into()))?;
+        let owner = record.owner_account_id;
+        let note_id = record.share.note_id;
+        let (content, attempt) = if let Some(entitlement_value) = args.get("entitlement") {
+            let entitlement: crate::remote_identity::SignedEnvelope<
+                crate::note_share::NoteShareEntitlement,
+            > = serde_json::from_value(entitlement_value.clone())
+                .map_err(|e| (INVALID_PARAMS, format!("invalid signed entitlement: {e}")))?;
+            let public_identity: crate::remote_identity::InstancePublicIdentity = args
+                .get("owner_public_identity")
+                .ok_or((
+                    INVALID_PARAMS,
+                    "owner_public_identity is required with entitlement".into(),
+                ))
+                .and_then(|value| {
+                    serde_json::from_value(value.clone()).map_err(|e| {
+                        (
+                            INVALID_PARAMS,
+                            format!("invalid owner public identity: {e}"),
+                        )
+                    })
+                })?;
+            ledger
+                .begin_read_with_entitlement(
+                    share_id,
+                    &entitlement,
+                    &public_identity,
+                    ctx.tenant_id,
+                    now,
+                )
+                .map_err(|e| (INVALID_PARAMS, e.to_string()))?
+        } else {
+            ledger
+                .begin_read(share_id, ctx.tenant_id, now)
+                .map_err(|e| (INVALID_PARAMS, e.to_string()))?
+        };
+        (content, attempt, owner, note_id)
+    };
+
+    let result = match content {
+        crate::note_share::NoteShareContent::FrozenSummary(summary) => {
+            serde_json::json!({"note_id": note_id, "content": summary, "content_type": "summary"})
+        }
+        crate::note_share::NoteShareContent::LiveNote => {
+            let session_id = optional_uuid(&args, "session_id")?
+                .or(session.effective_default_session_id())
+                .unwrap_or(uuid::Uuid::nil());
+            let owner_ctx = crate::types::TenantContext {
+                tenant_id: owner_account_id,
+                session_origin: ctx.session_origin.clone(),
+            };
+            let entity = storage
+                .entity_get_by_id(&owner_ctx, session_id, note_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                .ok_or((INVALID_PARAMS, "shared note not found".into()))?;
+            serde_json::json!({
+                "note_id": note_id,
+                "content_type": "live",
+                "title": entity.entity_name,
+                "content": entity.context_snippet,
+                "entity_type": entity.entity_type,
+            })
+        }
+    };
+    let completed = crate::note_share::global_ledger()
+        .lock()
+        .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?
+        .complete_read(share_id, attempt, chrono::Utc::now());
+    if let Err(error) = completed {
+        return Err((INVALID_PARAMS, error.to_string()));
+    }
+    if storage.note_share_persistence_enabled() {
+        storage
+            .note_share_audit_read(share_id, ctx.tenant_id, "success")
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("audit note-share read: {error}")))?;
+    }
+    Ok(result)
+}
+
+async fn handle_note_share_revoke(
+    args: Value,
+    storage: &impl crate::storage::Storage,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let share_id = require_uuid(&args, "share_id")?;
+    if storage.note_share_persistence_enabled()
+        && !storage
+            .note_share_revoke_durable(share_id, ctx.tenant_id)
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("revoke note share: {error}")))?
+    {
+        return Err((INVALID_PARAMS, "note share not found".into()));
+    }
+    crate::note_share::global_ledger()
+        .lock()
+        .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?
+        .revoke(share_id, ctx.tenant_id)
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    Ok(serde_json::json!({"share_id": share_id, "revoked": true}))
 }
 
 fn parse_entity_list_scope(args: &Value) -> Result<crate::types::EntityListScope, (i32, String)> {

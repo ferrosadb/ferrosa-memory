@@ -401,11 +401,12 @@ pub async fn run_control_listener(
             // phone needing a route to the database or a credential for it.
             memory_config.ferrosa.contact_points.clone(),
             configured_tenant.or_else(|| memory_tenant(memory_config.server.tenant_id.as_deref())),
+            Arc::clone(&identity),
         ),
     ));
 
-    if extensions.any() {
-        println!("{} session extension(s) attached", extensions.attach.len());
+    if !hooks.is_empty() {
+        println!("{} session extension(s) attached", hooks.len());
     } else {
         // Said out loud. A plain control session is the normal case for the
         // public binary, and silence would leave an operator unable to tell

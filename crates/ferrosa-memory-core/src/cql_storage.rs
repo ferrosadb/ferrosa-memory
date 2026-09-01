@@ -2087,6 +2087,152 @@ impl CqlStorage {
         &self.session
     }
 
+    /// Persist an owner-authoritative note share without copying live note
+    /// content. The JSON envelope contains only the share policy and an owner
+    /// account id; frozen summaries are explicit content selected by the owner.
+    pub async fn note_share_put(
+        &self,
+        owner_account_id: Uuid,
+        share: &crate::note_share::NoteShare,
+    ) -> anyhow::Result<()> {
+        let mut share_json = serde_json::to_value(share)?;
+        // A transport reservation is process-local. Persisting it across a
+        // restart would strand a read budget forever, so durable recovery
+        // always starts with an empty in-flight set.
+        share_json["in_flight_reads"] = serde_json::json!([]);
+        let payload = serde_json::json!({
+            "owner_account_id": owner_account_id,
+            "share": share_json,
+        });
+        let query = format!(
+            "INSERT INTO {}.note_share_entitlements (share_id, owner_account_id, note_id, recipient_account_id, entitlement_json, expires_at, revoked) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                query,
+                (
+                    share.share_id,
+                    owner_account_id,
+                    share.note_id,
+                    share.recipient_account_id,
+                    serde_json::to_string(&payload)?,
+                    share.policy.expires_at,
+                    false,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Load one share policy from the owner server. Read counters are kept in
+    /// the dedicated counter table so Cassandra's counter restrictions cannot
+    /// mix with ordinary entitlement columns.
+    pub async fn note_share_get(
+        &self,
+        share_id: Uuid,
+    ) -> anyhow::Result<Option<(Uuid, crate::note_share::NoteShare)>> {
+        let query = format!(
+            "SELECT owner_account_id, entitlement_json, revoked FROM {}.note_share_entitlements WHERE share_id = ?",
+            self.keyspace
+        );
+        let result = self.session.query_unpaged(query, (share_id,)).await?;
+        let map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let owner = cql_get::<Uuid>(row, &map, "owner_account_id")?;
+        let encoded = cql_get::<String>(row, &map, "entitlement_json")?;
+        let revoked = cql_get::<bool>(row, &map, "revoked").unwrap_or(false);
+        let payload: serde_json::Value = serde_json::from_str(&encoded)?;
+        let share: crate::note_share::NoteShare = serde_json::from_value(
+            payload
+                .get("share")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("note-share payload missing share"))?,
+        )?;
+        let counter_query = format!(
+            "SELECT successful_reads FROM {}.note_share_read_counters WHERE share_id = ?",
+            self.keyspace
+        );
+        let counter_result = self
+            .session
+            .query_unpaged(counter_query, (share_id,))
+            .await?;
+        let counter_map = build_col_map(counter_result.col_specs());
+        let successful_reads = counter_result
+            .rows_or_empty()
+            .first()
+            .and_then(|row| cql_get::<i64>(row, &counter_map, "successful_reads").ok())
+            .unwrap_or(0)
+            .clamp(0, u32::MAX as i64) as u32;
+        let mut share = share;
+        if revoked {
+            share.revoke();
+        }
+        share.restore_successful_reads(successful_reads);
+        Ok(Some((owner, share)))
+    }
+
+    /// Append an auditable read result and increment the durable success
+    /// counter only after content delivery succeeds.
+    pub async fn note_share_record_read(
+        &self,
+        share_id: Uuid,
+        recipient_account_id: Uuid,
+        result: &str,
+    ) -> anyhow::Result<()> {
+        let event_id = CqlTimeuuid::from(Uuid::new_v4());
+        let audit = format!(
+            "INSERT INTO {}.note_share_audit (share_id, occurred_at, event_id, recipient_account_id, result) VALUES (?, ?, ?, ?, ?)",
+            self.keyspace
+        );
+        self.session
+            .query_unpaged(
+                audit,
+                (
+                    share_id,
+                    chrono::Utc::now(),
+                    event_id,
+                    recipient_account_id,
+                    result,
+                ),
+            )
+            .await?;
+        if result == "success" {
+            let counter = format!(
+                "UPDATE {}.note_share_read_counters SET successful_reads = successful_reads + 1 WHERE share_id = ?",
+                self.keyspace
+            );
+            self.session.query_unpaged(counter, (share_id,)).await?;
+        }
+        Ok(())
+    }
+
+    /// Mark a share revoked atomically on the owner server. A revoked share
+    /// remains in the table for audit/replay; reads fail closed in the ledger.
+    pub async fn note_share_revoke(
+        &self,
+        share_id: Uuid,
+        owner_account_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let query = format!(
+            "UPDATE {}.note_share_entitlements SET revoked = true WHERE share_id = ? IF owner_account_id = ? AND revoked = false",
+            self.keyspace
+        );
+        let result = self
+            .session
+            .query_unpaged(query, (share_id, owner_account_id))
+            .await?;
+        let map = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(false);
+        };
+        Ok(cql_get::<bool>(row, &map, "[applied]").unwrap_or(false))
+    }
+
     /// Load entity types from the type registry table.
     /// Returns the default set if the table doesn't exist or is empty.
     pub async fn load_entity_types(&self) -> Vec<String> {
@@ -2528,6 +2674,43 @@ impl CqlStorage {
 }
 
 impl Storage for CqlStorage {
+    fn note_share_persistence_enabled(&self) -> bool {
+        true
+    }
+
+    async fn note_share_persist(
+        &self,
+        owner_account_id: Uuid,
+        share: &crate::note_share::NoteShare,
+    ) -> anyhow::Result<()> {
+        self.note_share_put(owner_account_id, share).await
+    }
+
+    async fn note_share_load(
+        &self,
+        share_id: Uuid,
+    ) -> anyhow::Result<Option<(Uuid, crate::note_share::NoteShare)>> {
+        self.note_share_get(share_id).await
+    }
+
+    async fn note_share_audit_read(
+        &self,
+        share_id: Uuid,
+        recipient_account_id: Uuid,
+        result: &str,
+    ) -> anyhow::Result<()> {
+        self.note_share_record_read(share_id, recipient_account_id, result)
+            .await
+    }
+
+    async fn note_share_revoke_durable(
+        &self,
+        share_id: Uuid,
+        owner_account_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        self.note_share_revoke(share_id, owner_account_id).await
+    }
+
     /// Resolve the path against this tenant's alias set and write the row.
     ///
     /// Delegates to [`crate::tier_store::CqlTierStore`] rather than restating

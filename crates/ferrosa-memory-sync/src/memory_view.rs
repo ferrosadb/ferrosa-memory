@@ -278,6 +278,190 @@ impl MemoryView {
         }))
     }
 
+    /// Persist the recipient binding created by a gateway activation. The LWT
+    /// keeps a second accepted account from widening an already-bound share.
+    pub async fn bind_note_share_recipient(
+        &self,
+        share_id: Uuid,
+        owner_account_id: Uuid,
+        recipient_account_id: Uuid,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            recipient_account_id != Uuid::nil(),
+            "recipient account is required"
+        );
+        let query = format!(
+            "UPDATE {}.note_share_entitlements SET recipient_account_id = ? WHERE share_id = ? IF owner_account_id = ? AND recipient_account_id = ?",
+            self.store.keyspace()
+        );
+        #[allow(deprecated)]
+        let result = self
+            .store
+            .query_session()
+            .query_unpaged(
+                query,
+                (
+                    recipient_account_id,
+                    share_id,
+                    owner_account_id,
+                    Uuid::nil(),
+                ),
+            )
+            .await?;
+        let columns = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("note-share binding LWT returned no row"))?;
+        Ok(cql_get::<bool>(row, &columns, "[applied]").unwrap_or(false))
+    }
+
+    /// Persist the recipient binding and the owner's signed entitlement in a
+    /// single LWT. The entitlement is part of the durable owner record so a
+    /// restart cannot leave an accepted activation with no assertion to
+    /// present to the receiving peer.
+    pub async fn bind_note_share_entitlement(
+        &self,
+        owner_account_id: Uuid,
+        share: &ferrosa_memory_core::note_share::NoteShare,
+        entitlement: &ferrosa_memory_core::remote_identity::SignedEnvelope<
+            ferrosa_memory_core::note_share::NoteShareEntitlement,
+        >,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            share.recipient_account_id != Uuid::nil(),
+            "bound note shares require a recipient"
+        );
+        let mut share_json = serde_json::to_value(share)?;
+        share_json["in_flight_reads"] = serde_json::json!([]);
+        let payload = serde_json::json!({
+            "owner_account_id": owner_account_id,
+            "share": share_json,
+            "signed_entitlement": entitlement,
+        });
+        let query = format!(
+            "UPDATE {}.note_share_entitlements SET recipient_account_id = ?, entitlement_json = ? WHERE share_id = ? IF owner_account_id = ? AND recipient_account_id = ?",
+            self.store.keyspace()
+        );
+        #[allow(deprecated)]
+        let result = self
+            .store
+            .query_session()
+            .query_unpaged(
+                query,
+                (
+                    share.recipient_account_id,
+                    serde_json::to_string(&payload)?,
+                    share.share_id,
+                    owner_account_id,
+                    Uuid::nil(),
+                ),
+            )
+            .await?;
+        let columns = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let row = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("note-share entitlement LWT returned no row"))?;
+        Ok(cql_get::<bool>(row, &columns, "[applied]").unwrap_or(false))
+    }
+
+    /// Persist a new pending note share on the owner server. The recipient is
+    /// deliberately nil until the gateway activation is accepted and the
+    /// authenticated control session binds it.
+    pub async fn persist_note_share(
+        &self,
+        owner_account_id: Uuid,
+        share: &ferrosa_memory_core::note_share::NoteShare,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            share.recipient_account_id == Uuid::nil(),
+            "new note shares must start pending"
+        );
+        let mut share_json = serde_json::to_value(share)?;
+        share_json["in_flight_reads"] = serde_json::json!([]);
+        let payload = serde_json::json!({
+            "owner_account_id": owner_account_id,
+            "share": share_json,
+        });
+        let query = format!(
+            "INSERT INTO {}.note_share_entitlements (share_id, owner_account_id, note_id, recipient_account_id, entitlement_json, expires_at, revoked) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.store.keyspace()
+        );
+        #[allow(deprecated)]
+        self.store
+            .query_session()
+            .query_unpaged(
+                query,
+                (
+                    share.share_id,
+                    owner_account_id,
+                    share.note_id,
+                    Uuid::nil(),
+                    serde_json::to_string(&payload)?,
+                    share.policy.expires_at,
+                    false,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reload one durable share after a listener restart. The serving ledger
+    /// is intentionally process-local, while the owner record and read budget
+    /// live in CQL; binding must therefore be able to hydrate the cache.
+    pub async fn load_note_share(
+        &self,
+        share_id: Uuid,
+    ) -> Result<Option<(Uuid, ferrosa_memory_core::note_share::NoteShare)>> {
+        let query = format!(
+            "SELECT owner_account_id, entitlement_json, revoked FROM {}.note_share_entitlements WHERE share_id = ?",
+            self.store.keyspace()
+        );
+        #[allow(deprecated)]
+        let result = self
+            .store
+            .query_session()
+            .query_unpaged(query, (share_id,))
+            .await?;
+        let columns = build_col_map(result.col_specs());
+        let rows = result.rows_or_empty();
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let owner = cql_get::<Uuid>(row, &columns, "owner_account_id")?;
+        let encoded = cql_get::<String>(row, &columns, "entitlement_json")?;
+        let revoked = cql_get::<bool>(row, &columns, "revoked").unwrap_or(false);
+        let payload: serde_json::Value = serde_json::from_str(&encoded)?;
+        let mut share: ferrosa_memory_core::note_share::NoteShare = serde_json::from_value(
+            payload
+                .get("share")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("note-share payload missing share"))?,
+        )?;
+        let counter_query = format!(
+            "SELECT successful_reads FROM {}.note_share_read_counters WHERE share_id = ?",
+            self.store.keyspace()
+        );
+        let counter_result = self
+            .store
+            .query_session()
+            .query_unpaged(counter_query, (share_id,))
+            .await?;
+        let counter_columns = build_col_map(counter_result.col_specs());
+        let successful_reads = counter_result
+            .rows_or_empty()
+            .first()
+            .and_then(|row| cql_get::<i64>(row, &counter_columns, "successful_reads").ok())
+            .unwrap_or(0)
+            .clamp(0, u32::MAX as i64) as u32;
+        share.restore_successful_reads(successful_reads);
+        if revoked {
+            share.revoke();
+        }
+        Ok(Some((owner, share)))
+    }
+
     /// The DIKW map.
     pub async fn map(&self) -> Result<TierSummary> {
         // The limit is vestigial: summarise counts per root and reads no

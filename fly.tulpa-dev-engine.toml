@@ -1,0 +1,39 @@
+# Private Fly deployment for the Tulpa Dev memory engine.
+# The engine has no public listener; the gateway reaches it over .internal DNS.
+
+app = "maas-dev-v2-engine"
+primary_region = "lax"
+
+[build]
+  dockerfile = "Containerfile.fly"
+
+[env]
+  FERROSA_MEMORY_CONFIG = "/etc/ferrosa-memory/config.toml"
+
+[[files]]
+  guest_path = "/etc/ferrosa-memory/config.toml"
+  secret_name = "FERROSA_MEMORY_CONFIG_TOML"
+
+[[files]]
+  guest_path = "/run/secrets/ferrosa-memory/tls.crt"
+  secret_name = "ENGINE_TLS_CERT_PEM"
+
+[[files]]
+  guest_path = "/run/secrets/ferrosa-memory/tls.key"
+  secret_name = "ENGINE_TLS_KEY_PEM"
+
+[[files]]
+  guest_path = "/run/secrets/ferrosa-memory/http-auth.toml"
+  secret_name = "ENGINE_HTTP_AUTH_TOML"
+
+[[files]]
+  guest_path = "/run/secrets/ferrosa-memory/cql-ca.pem"
+  secret_name = "ENGINE_CQL_CA_PEM"
+
+[[files]]
+  guest_path = "/run/secrets/ferrosa-memory/http-ca.pem"
+  secret_name = "ENGINE_HTTP_CA_PEM"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2048mb"

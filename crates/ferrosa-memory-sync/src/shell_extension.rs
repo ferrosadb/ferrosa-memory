@@ -34,6 +34,9 @@ use crate::session_runtime::{RunningSession, SessionRuntime};
 
 /// Configured sessions, and whoever is currently allowed to use them.
 pub struct ShellExtension {
+    /// The memory instance key used to attest entitlements after a gateway
+    /// activation is accepted. Private key material never leaves this process.
+    owner_identity: Arc<ferrosa_memory_core::remote_identity::InstanceSigningIdentity>,
     /// The machine's configs. Shared by every device, which is the point:
     /// the tablet and the phone see one list, and a resumed tmux session can
     /// be attributed to the config that made it.
@@ -90,10 +93,12 @@ impl ShellExtension {
         store_path: impl Into<PathBuf>,
         board_contact_points: Vec<String>,
         memory_tenant: Option<uuid::Uuid>,
+        owner_identity: Arc<ferrosa_memory_core::remote_identity::InstanceSigningIdentity>,
     ) -> Self {
         let store_path = store_path.into();
         let workspace = workspace.into();
         Self {
+            owner_identity,
             configs: Arc::new(Mutex::new(load_configs(&store_path))),
             store_path,
             runtime: Arc::new(SessionRuntime::new(workspace)),
@@ -1807,6 +1812,10 @@ const DEFAULT_TASK_PAGE: usize = 10;
 const MEMORY_PAGE_DEFAULT: usize = 20;
 const MEMORY_PAGE_MAX: usize = 50;
 
+/// Frozen summaries are deliberately small on the control channel. Larger
+/// notes use the owner MCP read path, which can page content safely.
+const MAX_NOTE_SHARE_SUMMARY_CHARS: usize = 512;
+
 /// A map is orientation, not a dump of every source root. Keeping this small
 /// ensures the first response after reconnect fits a cellular data channel.
 const MEMORY_TIER_ROOT_PREVIEW: usize = 2;
@@ -2260,6 +2269,9 @@ pub const SHELL_KINDS: &[&str] = &[
     "shell_memory_tiers",
     "shell_memory_items",
     "shell_memory_item",
+    "shell_note_share_create",
+    "shell_note_share_bind",
+    "shell_note_share_read",
     // These four had handlers and were never CLAIMED, so every one of
     // them fell through to the built-in dispatcher, which does not
     // know them and closes the channel. Adding a handler is half the
@@ -2750,6 +2762,247 @@ impl SessionExtension for ShellExtension {
                     .send(&envelope(self.memory_item_frame(id, item_session).await))
                     .await
             }
+            "shell_note_share_create" => {
+                let share_id = body
+                    .get("share_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "note share creation needs a share id".to_owned())
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value)
+                            .map_err(|_| "note share id is not a UUID".to_owned())
+                    })?;
+                let note_id = body
+                    .get("note_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "note share creation needs a note id".to_owned())
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value).map_err(|_| "note id is not a UUID".to_owned())
+                    })?;
+                let owner = self
+                    .memory_tenant
+                    .ok_or_else(|| "no owner memory tenant is configured".to_owned())?;
+                let expires_at = body
+                    .get("expires_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(7));
+                if expires_at <= chrono::Utc::now() {
+                    return Err("note share expiration must be in the future".to_owned());
+                }
+                let content = body
+                    .get("frozen_summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| {
+                        ferrosa_memory_core::note_share::NoteShareContent::FrozenSummary(
+                            value.chars().take(MAX_NOTE_SHARE_SUMMARY_CHARS).collect(),
+                        )
+                    })
+                    .unwrap_or(ferrosa_memory_core::note_share::NoteShareContent::LiveNote);
+
+                // The mobile client deliberately reuses the same opaque share
+                // id when an HTTP response is lost. Treat the owner-side create
+                // as an idempotent retry when it names the same note and owner;
+                // a mismatched retry must fail closed instead of replacing the
+                // existing capability.
+                let existing = ferrosa_memory_core::note_share::global_ledger()
+                    .lock()
+                    .map_err(|_| "note share ledger unavailable".to_owned())?
+                    .record(share_id)
+                    .cloned();
+                if let Some(existing) = existing {
+                    if existing.owner_account_id != owner || existing.share.note_id != note_id {
+                        return Err(
+                            "note share id is already used for another owner or note".to_owned()
+                        );
+                    }
+                    return session
+                        .send(&envelope(serde_json::json!({
+                            "type": "shell_note_share_created",
+                            "share_id": share_id,
+                            "note_id": note_id,
+                            "expires_at": existing.share.policy.expires_at
+                        })))
+                        .await;
+                }
+                let share = ferrosa_memory_core::note_share::NoteShare::new(
+                    share_id,
+                    note_id,
+                    uuid::Uuid::nil(),
+                    content,
+                    ferrosa_memory_core::note_share::NoteSharePolicy::expires_at(expires_at),
+                );
+                if let Some(view) = self.memory().await {
+                    view.persist_note_share(owner, &share)
+                        .await
+                        .map_err(|error| format!("persist note share: {error:#}"))?;
+                }
+                ferrosa_memory_core::note_share::global_ledger()
+                    .lock()
+                    .map_err(|_| "note share ledger unavailable".to_owned())?
+                    .insert(owner, share)
+                    .map_err(|error| error.to_string())?;
+                session
+                    .send(&envelope(serde_json::json!({
+                        "type": "shell_note_share_created",
+                        "share_id": share_id,
+                        "note_id": note_id,
+                        "expires_at": expires_at
+                    })))
+                    .await
+            }
+            "shell_note_share_bind" => {
+                let share_id = body
+                    .get("share_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "note share binding needs a share id".to_owned())
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value)
+                            .map_err(|_| "note share id is not a UUID".to_owned())
+                    })?;
+                let recipient = body
+                    .get("recipient_account_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "note share binding needs a recipient account".to_owned())
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value)
+                            .map_err(|_| "recipient account is not a UUID".to_owned())
+                    })?;
+                let owner = self
+                    .memory_tenant
+                    .ok_or_else(|| "no owner memory tenant is configured".to_owned())?;
+                // Hydrate the process-local serving cache after a restart.
+                let mut bound_share = if let Some(record) =
+                    ferrosa_memory_core::note_share::global_ledger()
+                        .lock()
+                        .map_err(|_| "note share ledger unavailable".to_owned())?
+                        .record(share_id)
+                {
+                    record.share.clone()
+                } else if let Some(view) = self.memory().await {
+                    let Some((persisted_owner, share)) = view
+                        .load_note_share(share_id)
+                        .await
+                        .map_err(|error| format!("load durable note share: {error:#}"))?
+                    else {
+                        return Err("note share not found".to_owned());
+                    };
+                    if persisted_owner != owner {
+                        return Err("note share does not belong to this owner".to_owned());
+                    }
+                    ferrosa_memory_core::note_share::global_ledger()
+                        .lock()
+                        .map_err(|_| "note share ledger unavailable".to_owned())?
+                        .insert(owner, share.clone())
+                        .map_err(|error| error.to_string())?;
+                    share
+                } else {
+                    return Err("note share ledger unavailable".to_owned());
+                };
+
+                if bound_share.recipient_account_id == uuid::Uuid::nil() {
+                    // Build the bound snapshot before mutating either side.
+                    // The CQL LWT persists recipient + signed assertion as one
+                    // operation, while the ledger remains the serving cache.
+                    bound_share
+                        .bind_recipient(recipient)
+                        .map_err(|error| error.to_string())?;
+                    let entitlement = bound_share
+                        .issue_entitlement(&self.owner_identity)
+                        .map_err(|error| error.to_string())?;
+                    if let Some(view) = self.memory().await {
+                        let persisted = view
+                            .bind_note_share_entitlement(owner, &bound_share, &entitlement)
+                            .await
+                            .map_err(|error| format!("persist note share binding: {error:#}"))?;
+                        if !persisted {
+                            return Err("note share binding was already set or does not belong to this owner".to_owned());
+                        }
+                    }
+                    ferrosa_memory_core::note_share::global_ledger()
+                        .lock()
+                        .map_err(|_| "note share ledger unavailable".to_owned())?
+                        .bind_recipient(share_id, owner, recipient)
+                        .map_err(|error| error.to_string())?;
+                } else if bound_share.recipient_account_id != recipient {
+                    return Err("note share is bound to another recipient".to_owned());
+                }
+                let entitlement = bound_share
+                    .issue_entitlement(&self.owner_identity)
+                    .map_err(|error| error.to_string())?;
+                session
+                    .send(&envelope(serde_json::json!({
+                        "type": "shell_note_share_bound",
+                        "share_id": share_id,
+                        "recipient_account_id": recipient,
+                        "entitlement": entitlement,
+                        "owner_public_identity": self.owner_identity.public_identity()
+                    })))
+                    .await
+            }
+            "shell_note_share_read" => {
+                let share_id = body
+                    .get("share_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "note share read needs a share id".to_owned())
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value)
+                            .map_err(|_| "note share id is not a UUID".to_owned())
+                    })?;
+                let recipient = body
+                    .get("recipient_account_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "note share read needs a recipient account".to_owned())
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value)
+                            .map_err(|_| "recipient account is not a UUID".to_owned())
+                    })?;
+                let entitlement = body
+                    .get("entitlement")
+                    .ok_or_else(|| "note share read needs the signed entitlement".to_owned())
+                    .and_then(|value| {
+                        serde_json::from_value::<
+                            ferrosa_memory_core::remote_identity::SignedEnvelope<
+                                ferrosa_memory_core::note_share::NoteShareEntitlement,
+                            >,
+                        >(value.clone())
+                        .map_err(|error| format!("invalid signed entitlement: {error}"))
+                    })?;
+                let (content, attempt) = ferrosa_memory_core::note_share::global_ledger()
+                    .lock()
+                    .map_err(|_| "note share ledger unavailable".to_owned())?
+                    .begin_read_with_entitlement(
+                        share_id,
+                        &entitlement,
+                        &self.owner_identity.public_identity(),
+                        recipient,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let payload = match content {
+                    ferrosa_memory_core::note_share::NoteShareContent::FrozenSummary(summary) => {
+                        serde_json::json!({"content_type": "summary", "content": summary})
+                    }
+                    ferrosa_memory_core::note_share::NoteShareContent::LiveNote => {
+                        let _ = ferrosa_memory_core::note_share::global_ledger()
+                            .lock()
+                            .map_err(|_| "note share ledger unavailable".to_owned())?
+                            .abandon_read(share_id, attempt);
+                        return Err("live note reads must use the owner MCP read path".to_owned());
+                    }
+                };
+                ferrosa_memory_core::note_share::global_ledger()
+                    .lock()
+                    .map_err(|_| "note share ledger unavailable".to_owned())?
+                    .complete_read(share_id, attempt, chrono::Utc::now())
+                    .map_err(|error| error.to_string())?;
+                session
+                    .send(&envelope(serde_json::json!({
+                        "type": "shell_note_share_content",
+                        "share_id": share_id,
+                        "content": payload
+                    })))
+                    .await
+            }
             other => Err(format!("claimed {other} and cannot serve it")),
         }
     }
@@ -3077,6 +3330,9 @@ mod output_framing_tests {
         ("shell_memory_tiers", Sizing::Bounded),
         ("shell_memory_items", Sizing::Paged),
         ("shell_memory_item", Sizing::Bounded),
+        ("shell_note_share_bound", Sizing::Bounded),
+        ("shell_note_share_created", Sizing::Bounded),
+        ("shell_note_share_content", Sizing::Bounded),
         ("shell_rules", Sizing::Paged),
         ("shell_rule_detail", Sizing::Paged),
         ("shell_rules_tally", Sizing::Bounded),
@@ -3174,6 +3430,24 @@ mod output_framing_tests {
                         "id": uuid::Uuid::now_v7().to_string(),
                         "name": "ferrosa-suite claude",
                     })).collect::<Vec<_>>(),
+                }),
+                "shell_note_share_bound" => serde_json::json!({
+                    "type": kind,
+                    "share_id": uuid::Uuid::now_v7(),
+                    "recipient_account_id": uuid::Uuid::now_v7(),
+                    "entitlement": {},
+                    "owner_public_identity": {},
+                }),
+                "shell_note_share_created" => serde_json::json!({
+                    "type": kind,
+                    "share_id": uuid::Uuid::now_v7(),
+                    "note_id": uuid::Uuid::now_v7(),
+                    "expires_at": chrono::Utc::now(),
+                }),
+                "shell_note_share_content" => serde_json::json!({
+                    "type": kind,
+                    "share_id": uuid::Uuid::now_v7(),
+                    "content": {"content_type": "summary", "content": "a".repeat(MAX_NOTE_SHARE_SUMMARY_CHARS)},
                 }),
                 _ => serde_json::json!({
                     "type": kind,
