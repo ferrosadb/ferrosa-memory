@@ -69,6 +69,11 @@ pub enum Command {
     SecretDeny,
     /// List running microVMs.
     VmList,
+    /// Start a microVM from an image the machine advertised.
+    ///
+    /// Named `vm_launch` and not `launch`, one word from `agent_launch`, which
+    /// starts a teammate INSIDE a runtime rather than creating one.
+    VmLaunch,
     /// Write a running microVM to disk and stop it.
     VmHibernate,
     /// Wake a hibernated microVM from its snapshot.
@@ -96,6 +101,7 @@ impl Command {
             Self::SecretFulfil => "secret_fulfil",
             Self::SecretDeny => "secret_deny",
             Self::VmList => "vm_list",
+            Self::VmLaunch => "vm_launch",
             Self::VmHibernate => "vm_hibernate",
             Self::VmResume => "vm_resume",
             Self::CoordinatorOffer => "coordinator_offer",
@@ -115,6 +121,7 @@ impl Command {
             "secret_fulfil" => Self::SecretFulfil,
             "secret_deny" => Self::SecretDeny,
             "vm_list" => Self::VmList,
+            "vm_launch" => Self::VmLaunch,
             "vm_hibernate" => Self::VmHibernate,
             "vm_resume" => Self::VmResume,
             "coordinator_offer" => Self::CoordinatorOffer,
@@ -143,6 +150,7 @@ impl Command {
                 | Self::SecretFulfil
                 | Self::SecretDeny
                 | Self::VmList
+                | Self::VmLaunch
                 | Self::VmHibernate
                 | Self::VmResume
                 | Self::CoordinatorOffer
@@ -162,6 +170,7 @@ impl Command {
             | Self::VmList
             | Self::CoordinatorOffer => Effect::Read,
             Self::AgentLaunch
+            | Self::VmLaunch
             | Self::VmHibernate
             | Self::VmResume
             | Self::SecretFulfil
@@ -192,6 +201,7 @@ impl Command {
             Self::SecretFulfil,
             Self::SecretDeny,
             Self::VmList,
+            Self::VmLaunch,
             Self::VmHibernate,
             Self::VmResume,
             Self::CoordinatorOffer,
@@ -205,6 +215,27 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launching_a_vm_is_a_write_and_a_coordinator_command() {
+        // The last coordinator command that CREATES something. Classified with
+        // hibernate and resume rather than with the listings.
+        assert_eq!(Command::VmLaunch.effect(), Effect::Write);
+        assert!(Command::VmLaunch.is_coordinator_command());
+        assert!(!Command::VmLaunch.carries_secret());
+    }
+
+    #[test]
+    fn vm_launch_is_not_agent_launch() {
+        // Two different things a peer can ask for, and the names are one word
+        // apart. agent_launch starts a teammate inside an existing runtime;
+        // vm_launch creates the runtime. Sending one for the other would be
+        // accepted by the listener and do something else entirely.
+        assert_eq!(Command::VmLaunch.as_wire(), "vm_launch");
+        assert_eq!(Command::AgentLaunch.as_wire(), "agent_launch");
+        assert_eq!(Command::from_wire("vm_launch"), Command::VmLaunch);
+        assert!(!Command::AgentLaunch.is_coordinator_command());
+    }
 
     /// Hibernation is the first pair of commands that CHANGES a VM rather than
     /// listing one, so the classification matters more than the spelling.
@@ -316,6 +347,7 @@ mod tests {
                     | Command::SecretFulfil
                     | Command::SecretDeny
                     | Command::VmList
+                    | Command::VmLaunch
                     | Command::VmHibernate
                     | Command::VmResume
                     | Command::CoordinatorOffer
