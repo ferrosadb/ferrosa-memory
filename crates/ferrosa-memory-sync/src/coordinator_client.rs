@@ -149,7 +149,9 @@ impl CoordinatorConfig {
 /// anything that would need encoding does not.
 fn safe_vm_id(id: &str) -> Result<&str, CoordinatorError> {
     if id.is_empty() {
-        return Err(CoordinatorError::Malformed("a vm id is required".to_owned()));
+        return Err(CoordinatorError::Malformed(
+            "a vm id is required".to_owned(),
+        ));
     }
     if !id
         .chars()
@@ -172,13 +174,15 @@ mod tests {
         // a URL PATH. A slash makes it address a different endpoint; an encoded
         // one can walk out of /v1/vms entirely.
         for bad in ["../secrets", "a/b", "vm%2f..", "", "with space"] {
-            assert!(safe_vm_id(bad).is_err(), "{bad:?} was accepted into a url path");
+            assert!(
+                safe_vm_id(bad).is_err(),
+                "{bad:?} was accepted into a url path"
+            );
         }
         for good in ["vm-1", "hib-demo", "a_b.c"] {
             assert!(safe_vm_id(good).is_ok(), "{good:?} was refused");
         }
     }
-
 
     fn write_token(dir: &Path, contents: &str) -> PathBuf {
         let creds = dir.join("credentials");
@@ -361,7 +365,6 @@ impl CoordinatorClient {
         let setup = self.get_json("/v1/setup").await.ok();
         Ok(serde_json::json!({ "offering": offering, "setup": setup }))
     }
-
 
     /// Write a running microVM to disk and stop it.
     ///

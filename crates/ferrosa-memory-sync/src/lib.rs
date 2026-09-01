@@ -28,10 +28,10 @@
 
 pub mod artifact_view;
 pub mod codex_runtime;
+pub mod control_frame;
 #[cfg(feature = "webrtc-transport")]
 pub mod control_session;
 pub mod coordinator_client;
-pub mod control_frame;
 pub mod coordinator_command;
 pub mod device_request;
 /// The control-listener runtime, so every binary hosting one shares it.

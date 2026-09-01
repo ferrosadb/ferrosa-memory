@@ -936,11 +936,11 @@ async fn cmd_control_connect(
 ) -> anyhow::Result<()> {
     use ferrosa_memory_sync::control_frame::control_frame;
     use ferrosa_memory_sync::control_session::{
-        run_control_controller_session, ControlSessionConfig,
+        ControlSessionConfig, run_control_controller_session,
     };
     use ferrosa_memory_sync::peer_cli;
     use ferrosa_memory_sync::signaling_client::{
-        Credential, ControlSignalingApi, HttpSignalingClient,
+        ControlSignalingApi, Credential, HttpSignalingClient,
     };
 
     // Parsed BEFORE a session is offered. A malformed payload discovered after

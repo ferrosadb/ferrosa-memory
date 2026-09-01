@@ -255,7 +255,6 @@ mod tests {
         assert_eq!(CoordinatorCommand::VmResume.effect(), Effect::Write);
     }
 
-
     fn device() -> Vec<String> {
         vec![COORDINATOR_CAPABILITY.to_owned()]
     }

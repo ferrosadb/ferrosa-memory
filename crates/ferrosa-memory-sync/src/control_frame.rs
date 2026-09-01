@@ -70,11 +70,15 @@ mod tests {
     fn the_payload_is_carried_verbatim_where_commands_read_it() {
         let frame = control_frame("vm_hibernate", serde_json::json!({"id": "vm-1"}));
         assert_eq!(
-            frame.pointer("/body/payload/id").and_then(serde_json::Value::as_str),
+            frame
+                .pointer("/body/payload/id")
+                .and_then(serde_json::Value::as_str),
             Some("vm-1")
         );
         assert_eq!(
-            frame.pointer("/body/command_type").and_then(serde_json::Value::as_str),
+            frame
+                .pointer("/body/command_type")
+                .and_then(serde_json::Value::as_str),
             Some("vm_hibernate")
         );
     }
