@@ -72,6 +72,7 @@ pub mod rule_palette;
 
 pub mod geojson;
 pub mod ontology;
+pub mod poll_backoff;
 pub mod rule_blocks;
 pub mod rules_view;
 pub mod scope;
