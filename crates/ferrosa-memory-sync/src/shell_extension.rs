@@ -2560,6 +2560,17 @@ const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 ///
 /// The first tick sends everything, because a device that just connected has
 /// no prior state to diff against.
+/// Whether this status tick must emit a `shell_status` frame.
+///
+/// A tick with nothing to report stays silent, because a periodic empty list is
+/// a heartbeat pretending to be news. The FIRST tick is different: it is the
+/// only frame marked `full`, and `full` is what tells the device to clear and
+/// adopt this roster. Suppressing that one leaves the device with no roster and
+/// no second chance, since the flag is spent either way.
+fn should_send_status(jobs_is_empty: bool, first: bool) -> bool {
+    first || !jobs_is_empty
+}
+
 async fn pump_status(
     configs: Arc<Mutex<Vec<SessionConfig>>>,
     runtime: Arc<SessionRuntime>,
@@ -2729,8 +2740,10 @@ async fn pump_status(
         }
 
         // Nothing moved. Say nothing — a tick that sends an empty list every
-        // three seconds is a heartbeat pretending to be news.
-        if !jobs.is_empty() {
+        // three seconds is a heartbeat pretending to be news. The first tick
+        // is the exception: it carries `full`, which is what tells the device
+        // to adopt this roster at all.
+        if should_send_status(jobs.is_empty(), first) {
             let frame = serde_json::json!({
                 "version": 1,
                 "frame_id": uuid::Uuid::now_v7().to_string(),
@@ -2747,9 +2760,11 @@ async fn pump_status(
                 // The channel has gone; so has the reason to keep scraping.
                 return;
             }
+
+            // Spend `full` only on a frame that actually carried it.
+            first = false;
         }
 
-        first = false;
         tokio::time::sleep(STATUS_INTERVAL).await;
     }
 }
@@ -3970,6 +3985,31 @@ fn save_configs(path: &PathBuf, configs: &[SessionConfig]) {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    /// The device adopts a roster only from a frame marked `full`, and
+    /// `pump_status` offers exactly one of those: the first tick. A first tick
+    /// that happens to find nothing running must still send it. Suppressing it
+    /// leaves the device with no roster and no second chance, because the flag
+    /// is spent either way -- which is how the job list silently never arrived.
+    #[test]
+    fn first_status_tick_sends_even_when_nothing_is_running() {
+        assert!(
+            should_send_status(true, true),
+            "the first tick carries `full`; an empty roster is still news"
+        );
+    }
+
+    #[test]
+    fn a_tick_with_jobs_always_sends() {
+        assert!(should_send_status(false, true), "first tick, jobs present");
+        assert!(should_send_status(false, false), "later tick, jobs present");
+    }
+
+    /// A periodic empty list is a heartbeat pretending to be news.
+    #[test]
+    fn a_later_empty_tick_stays_silent() {
+        assert!(!should_send_status(true, false));
+    }
 
     fn store() -> PathBuf {
         std::env::temp_dir().join(format!("ferrosa-configs-{}.json", uuid::Uuid::now_v7()))

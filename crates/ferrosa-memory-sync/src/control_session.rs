@@ -820,10 +820,21 @@ where
     }
 }
 
+/// Address families this control session gathers ICE candidates on.
+///
+/// Both, deliberately. This machine and the controlling phone are routinely
+/// on the same IPv6 /64, which is the most reliable direct pair available.
+/// Gathering IPv4 only discarded that pair and left the session depending on
+/// STUN-reflexive IPv4, which fails intermittently on this unpaid path
+/// because there is no TURN relay to fall back to.
+fn ice_network_types() -> Vec<webrtc::ice::network_type::NetworkType> {
+    use webrtc::ice::network_type::NetworkType;
+    vec![NetworkType::Udp4, NetworkType::Udp6]
+}
+
 fn build_rtc_api(config: &ControlSessionConfig) -> Result<webrtc::api::API, ControlSessionError> {
     use webrtc::api::setting_engine::SettingEngine;
     use webrtc::ice::mdns::MulticastDnsMode;
-    use webrtc::ice::network_type::NetworkType;
 
     // The workspace enables both Rustls providers through independent HTTP
     // and WebRTC dependencies, so auto-selection deliberately refuses. Ring
@@ -836,7 +847,12 @@ fn build_rtc_api(config: &ControlSessionConfig) -> Result<webrtc::api::API, Cont
         .map_err(|error| ControlSessionError::Rtc(format!("interceptors: {error}")))?;
     let mut settings = SettingEngine::default();
     settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
-    settings.set_network_types(vec![NetworkType::Udp4]);
+    // Gather IPv6 as well as IPv4. This machine and the controlling phone are
+    // routinely on the same IPv6 /64, which is the most reliable direct pair
+    // available. Restricting to Udp4 discarded that pair entirely and left the
+    // session depending on STUN-reflexive IPv4, which fails intermittently on
+    // this unpaid path because there is no TURN relay to fall back to.
+    settings.set_network_types(ice_network_types());
     if config.allow_loopback {
         settings.set_include_loopback_candidate(true);
     }
@@ -1803,6 +1819,21 @@ pub fn capability_unavailable_reply(frame_id: &str, reason: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// This machine and the controlling phone are routinely on the same IPv6
+    /// /64, which is the most reliable direct pair available. Gathering IPv4
+    /// only discarded that pair and left the session on STUN-reflexive IPv4
+    /// with no TURN to fall back to, so the handshake failed intermittently.
+    #[test]
+    fn ice_gathers_both_address_families() {
+        use webrtc::ice::network_type::NetworkType;
+        let types = ice_network_types();
+        assert!(types.contains(&NetworkType::Udp4), "IPv4 must remain");
+        assert!(
+            types.contains(&NetworkType::Udp6),
+            "IPv6 is the reliable same-/64 direct pair"
+        );
+    }
 
     use chrono::Utc;
     use ferrosa_memory_core::control_store::{
