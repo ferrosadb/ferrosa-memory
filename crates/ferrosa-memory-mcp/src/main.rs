@@ -794,6 +794,48 @@ impl Storage for ReconnectingStorage {
         delegate!(self, memo_put, ctx, entry)
     }
 
+    fn note_share_persistence_enabled(&self) -> bool {
+        true
+    }
+
+    async fn note_share_persist(
+        &self,
+        owner_account_id: uuid::Uuid,
+        share: &ferrosa_memory_core::note_share::NoteShare,
+    ) -> anyhow::Result<()> {
+        delegate!(self, note_share_persist, owner_account_id, share)
+    }
+
+    async fn note_share_load(
+        &self,
+        share_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<(uuid::Uuid, ferrosa_memory_core::note_share::NoteShare)>> {
+        delegate!(self, note_share_load, share_id)
+    }
+
+    async fn note_share_audit_read(
+        &self,
+        share_id: uuid::Uuid,
+        recipient_account_id: uuid::Uuid,
+        result: &str,
+    ) -> anyhow::Result<()> {
+        delegate!(
+            self,
+            note_share_audit_read,
+            share_id,
+            recipient_account_id,
+            result
+        )
+    }
+
+    async fn note_share_revoke_durable(
+        &self,
+        share_id: uuid::Uuid,
+        owner_account_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        delegate!(self, note_share_revoke_durable, share_id, owner_account_id)
+    }
+
     // Delegate to the live CQL session so schema status reflects the actual
     // database, not the binary default. When disconnected this fails loudly
     // (NOT_CONNECTED_MSG) rather than reporting a fabricated db_version.

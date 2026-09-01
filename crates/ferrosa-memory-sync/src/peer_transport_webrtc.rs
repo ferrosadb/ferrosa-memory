@@ -1,24 +1,29 @@
 //! MAAS-T-25b — concrete `webrtc-rs` binding for the peer-transport seam.
 //!
 //! This module is compiled only under the `webrtc-transport` feature. It wires
-//! the dependency-free transport core in [`super`] to a real `webrtc-rs`
+//! the dependency-free transport core in `crate::peer_transport` to a real `webrtc-rs`
 //! `RTCDataChannel`:
 //!
-//! - [`RtcDataChannel`] implements [`super::DataChannel`] over an
+//! - [`crate::peer_transport::webrtc::RtcDataChannel`] implements
+//!   [`crate::peer_transport::DataChannel`] over an
 //!   `Arc<RTCDataChannel>` — `ready_state()` → `is_open`,
 //!   `buffered_amount` + `on_buffered_amount_low` → `wait_buffered_below`,
-//!   `send(&Bytes)` → `send`. A [`super::PeerTransport`] built on it inherits
+//!   `send(&Bytes)` → `send`. A [`crate::peer_transport::PeerTransport`] built
+//!   on it inherits
 //!   the MR-P2P-03/04/05/06 guarantees unchanged.
-//! - [`PackReceiver`] is the inbound half: it feeds each `on_message` frame
-//!   through [`super::decode_frame`] → bounded [`super::ChunkAssembler`] →
-//!   `PackRef` deserialize → [`crate::learner_ingest::ingest_pack`] (which
+//! - [`crate::peer_transport::webrtc::PackReceiver`] is the inbound half: it
+//!   feeds each `on_message` frame through [`crate::peer_transport::decode_frame`]
+//!   → bounded [`crate::peer_transport::ChunkAssembler`] →
+//!   [`crate::pack::PackRef`] deserialize → [`crate::learner_ingest::ingest_pack`] (which
 //!   AEAD-verifies before parse — T-33/T-27). Every outcome is recorded in a
-//!   [`ReceiverHealth`] snapshot so failures are observable, never silent.
+//!   [`crate::peer_transport::webrtc::ReceiverHealth`] snapshot so failures are
+//!   observable, never silent.
 //!
 //! # Wire protocol
 //!
-//! A sealed [`PackRef`] is serialized once and split into ≤`max_frame_payload`
-//! byte chunks ([`pack_ref_to_wire_chunks`]); each chunk is framed and sent by
+//! A sealed [`crate::pack::PackRef`] is serialized once and split into
+//! ≤`max_frame_payload` byte chunks
+//! ([`crate::peer_transport::webrtc::pack_ref_to_wire_chunks`]); each chunk is framed and sent by
 //! the transport core. The receiver reassembles the bytes (bounded), then
 //! deserializes and ingests. The transport-layer chunking is independent of the
 //! AEAD `SealedChunk`s *inside* the `PackRef` — framing is pure MTU sizing and

@@ -80,7 +80,7 @@ enum Command {
     /// broker (teacher side).
     #[cfg(feature = "webrtc-transport")]
     P2pShare {
-        /// Gateway base URL (e.g. https://gw.example).
+        /// Gateway base URL (e.g. <https://gw.example>).
         #[arg(long)]
         gateway: String,
         /// Enrolled device key file. The ONLY credential — it signs every
