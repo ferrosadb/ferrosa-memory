@@ -2501,13 +2501,17 @@ const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 /// no prior state to diff against.
 /// Whether this status tick must emit a `shell_status` frame.
 ///
-/// A tick with nothing to report stays silent, because a periodic empty list is
-/// a heartbeat pretending to be news. The FIRST tick is different: it is the
-/// only frame marked `full`, and `full` is what tells the device to clear and
-/// adopt this roster. Suppressing that one leaves the device with no roster and
-/// no second chance, since the flag is spent either way.
-fn should_send_status(jobs_is_empty: bool, first: bool) -> bool {
-    first || !jobs_is_empty
+/// Silent when there is nothing to report, INCLUDING the first tick. A periodic
+/// empty list is a heartbeat pretending to be news, and on the first tick it is
+/// worse than noise: that frame is marked `full`, and the device CLEARS its
+/// roster on a full send. An empty full frame therefore wipes the roster.
+///
+/// This is safe because the first tick is not actually silent when anything is
+/// running -- every emission branch below is guarded by `first ||`, so a running
+/// job pushes a row on tick one. `jobs` is empty here only when the machine has
+/// nothing running, and then there is no roster to adopt.
+fn should_send_status(jobs_is_empty: bool, _first: bool) -> bool {
+    !jobs_is_empty
 }
 
 async fn pump_status(
@@ -2679,9 +2683,7 @@ async fn pump_status(
         }
 
         // Nothing moved. Say nothing — a tick that sends an empty list every
-        // three seconds is a heartbeat pretending to be news. The first tick
-        // is the exception: it carries `full`, which is what tells the device
-        // to adopt this roster at all.
+        // three seconds is a heartbeat pretending to be news.
         if should_send_status(jobs.is_empty(), first) {
             let frame = serde_json::json!({
                 "version": 1,
@@ -2699,11 +2701,9 @@ async fn pump_status(
                 // The channel has gone; so has the reason to keep scraping.
                 return;
             }
-
-            // Spend `full` only on a frame that actually carried it.
-            first = false;
         }
 
+        first = false;
         tokio::time::sleep(STATUS_INTERVAL).await;
     }
 }
@@ -3925,16 +3925,14 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
-    /// The device adopts a roster only from a frame marked `full`, and
-    /// `pump_status` offers exactly one of those: the first tick. A first tick
-    /// that happens to find nothing running must still send it. Suppressing it
-    /// leaves the device with no roster and no second chance, because the flag
-    /// is spent either way -- which is how the job list silently never arrived.
+    /// An empty FIRST tick must stay silent. That frame is marked `full` and
+    /// the device clears its roster on a full send, so sending it empty wipes
+    /// every job off the device. Observed live: it put all 24 jobs off-shift.
     #[test]
-    fn first_status_tick_sends_even_when_nothing_is_running() {
+    fn an_empty_first_tick_does_not_wipe_the_roster() {
         assert!(
-            should_send_status(true, true),
-            "the first tick carries `full`; an empty roster is still news"
+            !should_send_status(true, true),
+            "an empty `full` frame is a destructive clear, not an initial snapshot"
         );
     }
 
