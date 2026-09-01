@@ -2876,6 +2876,165 @@
     }
   },
   {
+    "name": "note_share_create",
+    "description": "Create an owner-authoritative, read-only note share. The recipient account is bound at creation; shares default to seven days and cannot be re-shared. Only a frozen summary is copied; live notes stay on the owner server.",
+    "inputSchema": {
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "frozen_summary": {
+          "maxLength": 65536,
+          "type": "string"
+        },
+        "note_id": {
+          "type": "string"
+        },
+        "recipient_account_id": {
+          "type": "string"
+        },
+        "successful_read_limit": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "note_id",
+        "recipient_account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "note_share_read",
+    "description": "Read a note through an accepted share. Authorization, expiry, revocation, and the successful-read budget are checked on the owner server; a budget is consumed only after the content is delivered.",
+    "inputSchema": {
+      "properties": {
+        "entitlement": {
+          "description": "Owner-signed NoteShareEntitlement envelope returned after activation acceptance",
+          "type": "object"
+        },
+        "owner_public_identity": {
+          "description": "Owner instance public identity used to verify the entitlement",
+          "type": "object"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "share_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "share_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "note_share_revoke",
+    "description": "Immediately revoke a note share. Only the account that created the share can revoke it.",
+    "inputSchema": {
+      "properties": {
+        "share_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "share_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "name": "list",
     "description": "List entities with structured equality predicates over entity fields and properties. Use this for kanban/task-style queries such as all task entities with status=ready and assignee=claude; use hybrid_search for semantic recall.",
     "inputSchema": {

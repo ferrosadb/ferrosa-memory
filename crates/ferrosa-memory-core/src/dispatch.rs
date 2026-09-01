@@ -14451,7 +14451,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 22, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 23, "tier-1 tool surface should stay compact");
         assert!(
             tools.iter().any(|t| t["name"].as_str() == Some("forget")),
             "forget is a tier-1 tool"
