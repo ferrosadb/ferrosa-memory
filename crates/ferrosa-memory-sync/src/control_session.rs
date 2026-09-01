@@ -1409,6 +1409,24 @@ where
                 coordinator.pending_secrets().await
             }
             crate::coordinator_command::CoordinatorCommand::VmList => coordinator.vms().await,
+            crate::coordinator_command::CoordinatorCommand::VmHibernate => {
+                let id = payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ControlSessionError::Protocol("vm_hibernate needs an id".to_owned())
+                    })?;
+                coordinator.hibernate_vm(id).await
+            }
+            crate::coordinator_command::CoordinatorCommand::VmResume => {
+                let id = payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ControlSessionError::Protocol("vm_resume needs an id".to_owned())
+                    })?;
+                coordinator.resume_vm(id).await
+            }
             crate::coordinator_command::CoordinatorCommand::CoordinatorOffer => {
                 coordinator.offering().await
             }

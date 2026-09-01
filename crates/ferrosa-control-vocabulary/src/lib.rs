@@ -69,6 +69,10 @@ pub enum Command {
     SecretDeny,
     /// List running microVMs.
     VmList,
+    /// Write a running microVM to disk and stop it.
+    VmHibernate,
+    /// Wake a hibernated microVM from its snapshot.
+    VmResume,
     /// Report what this machine's coordinator can run: which tiers are live,
     /// what images it holds, and how much room is left.
     CoordinatorOffer,
@@ -92,6 +96,8 @@ impl Command {
             Self::SecretFulfil => "secret_fulfil",
             Self::SecretDeny => "secret_deny",
             Self::VmList => "vm_list",
+            Self::VmHibernate => "vm_hibernate",
+            Self::VmResume => "vm_resume",
             Self::CoordinatorOffer => "coordinator_offer",
             Self::NoteOpen => "note_open",
             Self::NoteAppend => "note_append",
@@ -109,6 +115,8 @@ impl Command {
             "secret_fulfil" => Self::SecretFulfil,
             "secret_deny" => Self::SecretDeny,
             "vm_list" => Self::VmList,
+            "vm_hibernate" => Self::VmHibernate,
+            "vm_resume" => Self::VmResume,
             "coordinator_offer" => Self::CoordinatorOffer,
             "note_open" => Self::NoteOpen,
             "note_append" => Self::NoteAppend,
@@ -135,6 +143,8 @@ impl Command {
                 | Self::SecretFulfil
                 | Self::SecretDeny
                 | Self::VmList
+                | Self::VmHibernate
+                | Self::VmResume
                 | Self::CoordinatorOffer
         )
     }
@@ -152,6 +162,8 @@ impl Command {
             | Self::VmList
             | Self::CoordinatorOffer => Effect::Read,
             Self::AgentLaunch
+            | Self::VmHibernate
+            | Self::VmResume
             | Self::SecretFulfil
             | Self::SecretDeny
             | Self::NoteOpen
@@ -180,6 +192,8 @@ impl Command {
             Self::SecretFulfil,
             Self::SecretDeny,
             Self::VmList,
+            Self::VmHibernate,
+            Self::VmResume,
             Self::CoordinatorOffer,
             Self::NoteOpen,
             Self::NoteAppend,
@@ -191,6 +205,41 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hibernation is the first pair of commands that CHANGES a VM rather than
+    /// listing one, so the classification matters more than the spelling.
+    #[test]
+    fn hibernate_and_resume_are_writes_not_reads() {
+        // vm_list sits next to these in every listing and is a Read. Copying
+        // its classification across would put a command that stops a running
+        // machine behind a read-only guard, which is the one direction that
+        // must never happen.
+        assert_eq!(Command::VmHibernate.effect(), Effect::Write);
+        assert_eq!(Command::VmResume.effect(), Effect::Write);
+    }
+
+    #[test]
+    fn hibernate_and_resume_are_answered_by_the_coordinator() {
+        assert!(Command::VmHibernate.is_coordinator_command());
+        assert!(Command::VmResume.is_coordinator_command());
+    }
+
+    #[test]
+    fn hibernate_and_resume_are_spelled_the_way_both_sides_expect() {
+        assert_eq!(Command::VmHibernate.as_wire(), "vm_hibernate");
+        assert_eq!(Command::VmResume.as_wire(), "vm_resume");
+        assert_eq!(Command::from_wire("vm_hibernate"), Command::VmHibernate);
+        assert_eq!(Command::from_wire("vm_resume"), Command::VmResume);
+    }
+
+    #[test]
+    fn neither_hibernate_nor_resume_carries_a_secret() {
+        // Both name a VM and nothing else, so a frame carrying one is safe to
+        // render in a log. Saying so explicitly means a future field that DID
+        // carry something has to change this test to land.
+        assert!(!Command::VmHibernate.carries_secret());
+        assert!(!Command::VmResume.carries_secret());
+    }
 
     /// The property the crate exists for: a name written by one side is read
     /// back as the same command by the other. Both sides call these functions,
@@ -267,6 +316,8 @@ mod tests {
                     | Command::SecretFulfil
                     | Command::SecretDeny
                     | Command::VmList
+                    | Command::VmHibernate
+                    | Command::VmResume
                     | Command::CoordinatorOffer
             );
             assert_eq!(

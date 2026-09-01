@@ -34,6 +34,10 @@ pub enum CoordinatorCommand {
     /// on loopback and is reached by the listener beside it, so nothing off the
     /// machine needs a port.
     CoordinatorOffer,
+    /// Write a running microVM to disk and stop it.
+    VmHibernate,
+    /// Wake a hibernated microVM from its snapshot.
+    VmResume,
 }
 
 /// What a command does to the world.
@@ -107,6 +111,8 @@ impl CoordinatorCommand {
             ferrosa_control_vocabulary::Command::SecretDeny => Some(Self::SecretDeny),
             ferrosa_control_vocabulary::Command::VmList => Some(Self::VmList),
             ferrosa_control_vocabulary::Command::CoordinatorOffer => Some(Self::CoordinatorOffer),
+            ferrosa_control_vocabulary::Command::VmHibernate => Some(Self::VmHibernate),
+            ferrosa_control_vocabulary::Command::VmResume => Some(Self::VmResume),
             // Not a coordinator command, or not one this build knows. `None`
             // lets the caller fall through to what it already handles.
             _ => None,
@@ -122,6 +128,8 @@ impl CoordinatorCommand {
             Self::SecretDeny => ferrosa_control_vocabulary::Command::SecretDeny,
             Self::VmList => ferrosa_control_vocabulary::Command::VmList,
             Self::CoordinatorOffer => ferrosa_control_vocabulary::Command::CoordinatorOffer,
+            Self::VmHibernate => ferrosa_control_vocabulary::Command::VmHibernate,
+            Self::VmResume => ferrosa_control_vocabulary::Command::VmResume,
         }
     }
 
@@ -137,6 +145,8 @@ impl CoordinatorCommand {
             ferrosa_control_vocabulary::Command::SecretDeny => "secret_deny",
             ferrosa_control_vocabulary::Command::VmList => "vm_list",
             ferrosa_control_vocabulary::Command::CoordinatorOffer => "coordinator_offer",
+            ferrosa_control_vocabulary::Command::VmHibernate => "vm_hibernate",
+            ferrosa_control_vocabulary::Command::VmResume => "vm_resume",
             _ => unreachable!("shared() only returns coordinator commands"),
         }
     }
@@ -223,6 +233,28 @@ pub fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hibernate_and_resume_arrive_as_coordinator_commands() {
+        assert_eq!(
+            CoordinatorCommand::from_wire("vm_hibernate"),
+            Some(CoordinatorCommand::VmHibernate)
+        );
+        assert_eq!(
+            CoordinatorCommand::from_wire("vm_resume"),
+            Some(CoordinatorCommand::VmResume)
+        );
+    }
+
+    #[test]
+    fn hibernating_is_a_write_even_though_it_sits_beside_vm_list() {
+        // vm_list is a Read and these are its neighbours. A command that stops
+        // a running machine must never be classified with it, because Effect is
+        // what a read-only guard consults.
+        assert_eq!(CoordinatorCommand::VmHibernate.effect(), Effect::Write);
+        assert_eq!(CoordinatorCommand::VmResume.effect(), Effect::Write);
+    }
+
 
     fn device() -> Vec<String> {
         vec![COORDINATOR_CAPABILITY.to_owned()]
