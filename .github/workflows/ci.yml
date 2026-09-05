@@ -861,7 +861,19 @@ jobs:
           cargo nextest run \
             --archive-file nextest-archive.tar.zst \
             --workspace-remap . \
-            --run-ignored ignored-only \
+          # `all`, not `ignored-only`. With `ignored-only` this step ran ONLY
+          # #[ignore]d tests, while `Tests & Coverage` uses `--lib --bins`,
+          # which excludes tests/ binaries entirely. Between them every
+          # non-ignored integration test fell through the gap: 167 of the
+          # workspace's 189 tests in tests/*.rs were executed by no job.
+          #
+          # That is how t12_every_created_table_is_granted_or_explicitly_exempt
+          # -- the guard against the entity_store grant incident, where writes
+          # fail silently under auth because the runtime role lacks MODIFY --
+          # sat failing on a branch whose eleven checks were all green.
+          #
+          # This step owns the live cluster, so it is the right place for them.
+            --run-ignored all \
             --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration)) and not (package(ferrosa-memory-sync) and binary(task_board_live))' \
             --no-fail-fast
       - name: Run system pytest suite against live cluster
