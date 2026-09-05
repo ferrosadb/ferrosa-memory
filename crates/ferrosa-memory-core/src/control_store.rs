@@ -498,23 +498,44 @@ async fn verify_existing_control_schema(
         );
     }
 
-    let probes = [
-        format!(
-            "SELECT next_cursor, reservation_token FROM {keyspace}.mobile_control_cursor_state LIMIT 1"
-        ),
-        format!("SELECT cursor, event_type, payload FROM {keyspace}.mobile_control_events LIMIT 1"),
-        format!(
-            "SELECT command_id, command_type, state, payload FROM {keyspace}.mobile_control_commands LIMIT 1"
-        ),
-    ];
-    for query in probes {
-        #[allow(deprecated)]
-        session
-            .query_unpaged(query, ())
-            .await
-            .context("probing existing mobile-control schema")?;
-    }
+    let [cursor_query, event_query, command_query] =
+        existing_control_schema_probe_queries(keyspace);
+    let tenant = Uuid::nil();
+    let fingerprint = "__ferrosa_mobile_schema_probe__";
+    #[allow(deprecated)]
+    session
+        .query_unpaged(cursor_query, (tenant, fingerprint))
+        .await
+        .context("probing existing mobile-control cursor schema")?;
+    #[allow(deprecated)]
+    session
+        .query_unpaged(event_query, (tenant, fingerprint, -1_i32))
+        .await
+        .context("probing existing mobile-control event schema")?;
+    #[allow(deprecated)]
+    session
+        .query_unpaged(command_query, (tenant, fingerprint))
+        .await
+        .context("probing existing mobile-control command schema")?;
     Ok(())
+}
+
+fn existing_control_schema_probe_queries(keyspace: &str) -> [String; 3] {
+    [
+        format!(
+            "SELECT next_cursor, reservation_token FROM {keyspace}.mobile_control_cursor_state \
+             WHERE tenant_id = ? AND server_fingerprint = ?"
+        ),
+        format!(
+            "SELECT cursor, event_type, payload FROM {keyspace}.mobile_control_events \
+             WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ?"
+        ),
+        format!(
+            "SELECT command_id, command_type, state, request_payload \
+             FROM {keyspace}.mobile_control_commands \
+             WHERE tenant_id = ? AND server_fingerprint = ?"
+        ),
+    ]
 }
 
 impl ControlStore for CqlControlStore {
@@ -723,7 +744,7 @@ impl ControlStore for CqlControlStore {
             for bucket in first_bucket..=last_bucket {
                 if events.len() >= fetch_limit {
                     break;
-                }
+                };
                 let lower = if bucket == first_bucket {
                     after
                 } else {
@@ -1089,20 +1110,32 @@ fn lwt_applied(result: scylla::LegacyQueryResult) -> anyhow::Result<Option<bool>
 }
 
 #[cfg(test)]
-mod replay_paging_tests {
+mod tests {
     use super::*;
 
-    /// The failure this exists to stop.
-    ///
-    /// A page that came back LARGER than asked walked past an `==` guard and
-    /// underflowed `fetch_limit - len` into a huge usize. The conversion then
-    /// failed with "out of range integral type conversion attempted", which
-    /// the session reported as a control protocol violation and hung up on —
-    /// every session, immediately, on the machine where it happened.
-    ///
-    /// It is reachable rather than theoretical: this engine ignores a bound
-    /// `LIMIT ?` and returns the whole partition, so the page size the caller
-    /// asked for was never binding.
+    #[test]
+    fn existing_schema_probe_is_partition_bounded() {
+        let queries = existing_control_schema_probe_queries("agent_memory");
+        assert_eq!(queries.len(), 3);
+        for query in queries {
+            assert!(query.contains("WHERE tenant_id = ? AND server_fingerprint = ?"));
+            assert!(!query.contains("system_schema"));
+            assert!(!query.contains("LIMIT"));
+        }
+    }
+
+    #[test]
+    fn existing_schema_probe_covers_every_control_table() {
+        let queries = existing_control_schema_probe_queries("agent_memory");
+        assert!(queries[0].contains("mobile_control_cursor_state"));
+        assert!(queries[0].contains("reservation_token"));
+        assert!(queries[1].contains("mobile_control_events"));
+        assert!(queries[1].contains("cursor_bucket = ?"));
+        assert!(queries[1].contains("payload"));
+        assert!(queries[2].contains("mobile_control_commands"));
+        assert!(queries[2].contains("request_payload"));
+    }
+
     #[test]
     fn an_overrun_page_reports_full_rather_than_underflowing() {
         assert_eq!(replay_remaining(10, 25).unwrap(), None);
@@ -1120,7 +1153,6 @@ mod replay_paging_tests {
         assert_eq!(replay_remaining(10, 0).unwrap(), Some(10));
     }
 
-    /// A limit past CQL's int range is an error, not a silent truncation.
     #[test]
     fn a_limit_beyond_cql_int_range_is_refused() {
         assert!(replay_remaining(usize::MAX, 0).is_err());

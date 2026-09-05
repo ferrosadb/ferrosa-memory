@@ -80,7 +80,7 @@ enum Command {
     /// broker (teacher side).
     #[cfg(feature = "webrtc-transport")]
     P2pShare {
-        /// Gateway base URL (e.g. https://gw.example).
+        /// Gateway base URL (e.g. <https://gw.example>).
         #[arg(long)]
         gateway: String,
         /// Enrolled device key file. The ONLY credential — it signs every
@@ -116,6 +116,35 @@ enum Command {
         /// (errors if there are zero or several — never guesses).
         #[arg(long)]
         session: Option<Uuid>,
+    },
+    /// Offer a control session to one Ferrosa Memory server device, bind the
+    /// signed WebRTC channel, and send one command over it.
+    ///
+    /// The controller half of `control-listen`. It exists so the transport can
+    /// be exercised machine-to-machine through the real gateway without a
+    /// mobile shell in the way -- debugging the transport and a UniFFI/Swift
+    /// binding at the same time is a bad trade -- and it is the executable
+    /// reference for what the mobile controller does.
+    #[cfg(feature = "webrtc-transport")]
+    ControlConnect {
+        /// Gateway base URL.
+        #[arg(long)]
+        gateway: String,
+        /// This controller's enrolled device key file.
+        ///
+        /// The ONLY credential, exactly as for `control-listen`: the identity
+        /// signs every request and there is no bearer secret anywhere.
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        /// Device id of the Ferrosa Memory server to control.
+        #[arg(long)]
+        server_device: Uuid,
+        /// Command type to send, e.g. `coordinator_offer` or `vm_hibernate`.
+        #[arg(long)]
+        command: String,
+        /// JSON object carried as the command's payload.
+        #[arg(long, default_value = "{}")]
+        payload: String,
     },
     /// Poll for mobile control offers addressed to this registered device,
     /// bind one direct signed WebRTC channel, and serve it until disconnect.
@@ -206,6 +235,14 @@ async fn main() -> anyhow::Result<()> {
             out_dir,
             session,
         } => cmd_p2p_receive(&gateway, &identity, &out_dir, session).await,
+        #[cfg(feature = "webrtc-transport")]
+        Command::ControlConnect {
+            gateway,
+            identity,
+            server_device,
+            command,
+            payload,
+        } => cmd_control_connect(&gateway, &identity, server_device, &command, &payload).await,
         #[cfg(feature = "webrtc-transport")]
         Command::ControlListen {
             gateway,
@@ -880,4 +917,69 @@ async fn raw_query(
         rows.push(row.with_context(|| format!("raw query row decode failed: {query}"))?);
     }
     Ok((col_map, rows))
+}
+
+/// Controller half of `control-listen`: offer a session to one server device,
+/// bind the signed channel, and send one command over it.
+///
+/// Deliberately has no Ferrosa store and no Codex runtime. The controller is a
+/// thin client -- every durable effect belongs to the server side -- so this
+/// stays a faithful model of what the mobile shell does, and a failure here
+/// implicates the transport rather than local storage.
+#[cfg(feature = "webrtc-transport")]
+async fn cmd_control_connect(
+    gateway: &str,
+    identity_path: &std::path::Path,
+    server_device: Uuid,
+    command: &str,
+    payload: &str,
+) -> anyhow::Result<()> {
+    use ferrosa_memory_sync::control_frame::control_frame;
+    use ferrosa_memory_sync::control_session::{
+        ControlSessionConfig, run_control_controller_session,
+    };
+    use ferrosa_memory_sync::peer_cli;
+    use ferrosa_memory_sync::signaling_client::{
+        ControlSignalingApi, Credential, HttpSignalingClient,
+    };
+
+    // Parsed BEFORE a session is offered. A malformed payload discovered after
+    // binding wastes a session on the server and reports itself as a transport
+    // problem.
+    let payload: serde_json::Value =
+        serde_json::from_str(payload).context("the payload must be JSON")?;
+
+    let identity = std::sync::Arc::new(peer_cli::load_identity(identity_path)?);
+    let fingerprint = identity.public_identity().public_key_fingerprint.0;
+    let api = HttpSignalingClient::with_credential(
+        gateway,
+        Credential::device(std::sync::Arc::clone(&identity)),
+    );
+    let config = ControlSessionConfig::default();
+
+    println!("controller fingerprint: {fingerprint}");
+    println!("offering a control session to {server_device} via {gateway}");
+    let session_id = api
+        .control_offer(server_device, &fingerprint)
+        .await
+        .context("offering the control session to the gateway")?;
+    println!("session {session_id} offered; waiting for the server to accept and bind");
+
+    // Binds the signed WebRTC channel. The identity is checked against the
+    // gateway-vouched fingerprint pair inside, so a mis-vouched session fails
+    // here rather than after data flows.
+    let mut channel = run_control_controller_session(&api, &identity, session_id, &config)
+        .await
+        .context("binding the direct control channel")?;
+    println!("session {session_id} bound directly");
+
+    let frame = control_frame(command, payload);
+    println!("--> {command}");
+    channel
+        .send_text(&frame.to_string())
+        .await
+        .context("sending the command frame")?;
+    let reply = channel.recv_text().await.context("awaiting the reply")?;
+    println!("<-- {reply}");
+    Ok(())
 }

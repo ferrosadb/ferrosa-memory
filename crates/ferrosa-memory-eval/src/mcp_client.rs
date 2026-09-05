@@ -1568,7 +1568,12 @@ for line in sys.stdin:
             &ctx,
             session_id,
             &first_owner,
-            Duration::from_secs(6),
+            // The lease expires after three seconds, but the surviving worker
+            // can be between polling ticks while the killed replica's CQL
+            // connection is being observed. Leave a full polling/claim window
+            // after expiry so this test checks takeover rather than runner
+            // scheduling jitter.
+            Duration::from_secs(15),
         )
         .await
         .expect("surviving replica should take over expired consolidation lease");

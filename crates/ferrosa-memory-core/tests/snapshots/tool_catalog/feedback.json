@@ -1,0 +1,300 @@
+[
+  {
+    "name": "outcome",
+    "description": "Records the result of a retrieval operation for offline routing improvement.\n\nCALL WHEN: After every retrieval operation (retrieve_fold_context, retrieve_entities, check_memo_cache). Provide program_type, task_complexity, succeeded, latency_ms, token_cost.\nThis is write-only (~1ms). No effect on current task but improves routing for future sessions.",
+    "inputSchema": {
+      "properties": {
+        "cwd": {
+          "description": "Working directory where the retrieval was evaluated. Enables workspace-specific reranking feedback.",
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "entity_ids": {
+          "description": "Entity IDs this outcome applies to. Success → warmth/workspace boost. Failure → warmth/workspace penalty.",
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "latency_ms": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "program_type": {
+          "enum": [
+            "hnsw_ann",
+            "phonetic",
+            "cypher_hop",
+            "btree_range",
+            "memo_hit",
+            "hybrid_search",
+            "hybrid_search_auto",
+            "workspace",
+            "retrieval_miss"
+          ],
+          "type": "string"
+        },
+        "query_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "retrieval_sources": {
+          "description": "Optional retrieval mechanisms/sources involved, e.g. entity_phonetic, entity_ann, workspace.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "succeeded": {
+          "type": "boolean"
+        },
+        "task_complexity": {
+          "enum": [
+            "simple",
+            "linear",
+            "quadratic"
+          ],
+          "type": "string"
+        },
+        "token_cost": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query_id",
+        "program_type",
+        "task_complexity",
+        "succeeded",
+        "latency_ms",
+        "token_cost"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "feedback",
+    "description": "Records feedback on the most recent hybrid_search result set for this session.\n\nCALL WHEN: Retrieved memories were clearly helpful, irrelevant, wrong, or impossible to judge for the current working directory. Cheapest form: pass scores in last-result order, where 1=helpful, -1=irrelevant/wrong, 0=neutral, and \"-\"=judge abstained/failed. Include cwd so future searches in the same directory are reranked dynamically.\nCost: ~5ms + small entity property updates.",
+    "inputSchema": {
+      "properties": {
+        "cwd": {
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "entity_ids": {
+          "description": "Optional subset of last results to score. Omit to score all entity results from the last retrieval.",
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "judge": {
+          "description": "Who made this judgment, e.g. caller_llm, human, judge_model. Scores from multiple judges are summed; abstentions are tracked separately.",
+          "maxLength": 64,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "relevant": {
+          "description": "Fallback when scores is omitted: apply one relevance label to all last results.",
+          "type": "boolean"
+        },
+        "scores": {
+          "description": "Per-result feedback in last retrieval order. 1=helpful, -1=irrelevant/wrong, 0=neutral, \"-\" or null=judge abstained/failed.",
+          "items": {},
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "config",
+    "description": "Read or update compact runtime defaults. Session-start hooks call this to let fmem create and store the active session_id; retrieval_limit controls default search result count.",
+    "inputSchema": {
+      "properties": {
+        "agent": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "agent_session_id": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "cwd": {
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "debug_stop": {
+          "description": "Hidden dev toggle. When true, tool responses carry a degraded-cluster alert (and fail on critical degradation) so you STOP and investigate instead of building on a broken cluster. Leave unset in normal use.",
+          "type": "boolean"
+        },
+        "default_limit": {
+          "description": "Alias for retrieval_limit.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "external_session_id": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "retrieval_limit": {
+          "description": "Default ranked results returned by retrieval tools when k/limit is omitted.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Optional explicit fmem UUID to install as the active runtime session. Hooks normally omit this.",
+          "type": "string"
+        },
+        "session_start": {
+          "description": "Set by a deterministic agent SessionStart hook. fmem creates/stores the active session_id from this metadata.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                "agent_session_id": {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                "cwd": {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                "external_session_id": {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                "thread_id": {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                "workspace": {
+                  "maxLength": 2048,
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ]
+        },
+        "thread_id": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "workspace": {
+          "maxLength": 2048,
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

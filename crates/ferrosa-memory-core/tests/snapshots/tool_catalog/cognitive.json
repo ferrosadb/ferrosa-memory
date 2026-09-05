@@ -1,0 +1,78 @@
+[
+  {
+    "name": "ingest",
+    "description": "YOUR PRIMARY TOOL FOR BUILDING LONG-TERM MEMORY. Automatically decides whether to CREATE, UPDATE, SUPERSEDE, or SKIP based on what you already know.\n\nCALL AGGRESSIVELY — every time you encounter something worth remembering:\n- User preferences, habits, or working style\n- Technical decisions and WHY they were made\n- Architecture patterns, library choices, configuration gotchas\n- People, roles, relationships mentioned in conversation\n- Project context: goals, constraints, deadlines, blockers\n- Debugging insights: what caused a bug, what fixed it\n- Tool/framework knowledge: 'X works well for Y', 'avoid Z because...'\n- Domain knowledge: business rules, API behaviors, data models\n- Corrections: 'user said X is wrong, Y is correct'\n\nDO NOT CALL for: ephemeral task state (use plan tools), raw code (derivable from files), or content the user explicitly marks as temporary.\n\nThe prediction error gate handles dedup — calling too often is better than missing important information. If in doubt, ingest it.\n\nRETURNS: action taken (Created/Updated/Superseded/Skipped) + entity_id.\nCost: ~15ms.",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "The content to ingest",
+          "maxLength": 8192,
+          "type": "string"
+        },
+        "embedding": {
+          "description": "Optional embedding vector",
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "entity_name": {
+          "description": "Clean entity name (e.g. 'Ben Kearns', 'Ferrosa'). If omitted, extracted automatically from content via LLM or heuristic.",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "entity_type": {
+          "enum": [
+            "person",
+            "place",
+            "organization"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Caller session UUID retained as ingest provenance. It does not move an existing entity or override its type-defined storage scope.",
+          "type": "string"
+        },
+        "source_fold_id": {
+          "description": "Optional: UUID of the fold (conversation thread) that produced this content. Omit or pass null if not in a fold context. DO NOT pass a file path — this field expects a fold UUID from start_fold, or null.",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "entity_type"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

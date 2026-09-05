@@ -1,0 +1,110 @@
+[
+  {
+    "name": "fact",
+    "description": "Records a timestamped fact about an entity. Auto-supersedes the previous fact, preserving history.\n\nCALL WHEN facts change over time — this is how you track evolution:\n- Role changes: 'Alice is now VP' supersedes 'Alice is Director'\n- Status updates: 'deploy succeeded' supersedes 'deploy in progress'\n- Project state: 'using Rust 1.82' supersedes 'using Rust 1.78'\n- Preference changes: 'user prefers dark mode' supersedes 'user likes light mode'\n- Bug status: 'fixed in commit abc' supersedes 'investigating OOM'\n\nFirst call ingest to create the entity, then write_temporal_fact for facts that evolve. The supersession chain is queryable — you can answer 'what was X before?'\n\nReturns: event_id of the new fact.\nCost: ~5ms.",
+    "inputSchema": {
+      "properties": {
+        "confidence": {
+          "description": "Confidence score (default: 1.0)",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "entity_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "fact_text": {
+          "description": "The fact to record",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_id",
+        "fact_text"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "history",
+    "description": "Returns the current (most recent valid) fact for an entity.\n\nCALL WHEN: You need to check the latest known fact about an entity before writing a new one, or to answer a question about current state.\nReturns: The current fact object, or {\"fact\": null} if no facts exist.\nCost: ~2ms.",
+    "inputSchema": {
+      "properties": {
+        "entity_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

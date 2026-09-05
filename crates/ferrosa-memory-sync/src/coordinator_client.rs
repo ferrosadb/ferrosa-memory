@@ -135,9 +135,54 @@ impl CoordinatorConfig {
     }
 }
 
+/// A VM id that is safe to place in a URL path, or an error saying why not.
+///
+/// The id arrives inside a control frame written by a peer and goes straight
+/// into a path segment. A slash re-points the request at a different endpoint
+/// and a percent-encoded one can walk out of `/v1/vms` altogether. The
+/// coordinator validates ids as well, but a request that should never have been
+/// sent is better refused here than answered with a 404 that reads as a missing
+/// VM.
+///
+/// A whitelist rather than an escaper, and deliberately narrower than what the
+/// coordinator accepts: everything a real VM id has ever contained passes, and
+/// anything that would need encoding does not.
+fn safe_vm_id(id: &str) -> Result<&str, CoordinatorError> {
+    if id.is_empty() {
+        return Err(CoordinatorError::Malformed(
+            "a vm id is required".to_owned(),
+        ));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(CoordinatorError::Malformed(format!(
+            "vm id {id:?} contains a character that cannot go in a url path"
+        )));
+    }
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vm_id_that_could_reshape_the_url_is_refused() {
+        // The id arrives in a control frame from a peer and goes straight into
+        // a URL PATH. A slash makes it address a different endpoint; an encoded
+        // one can walk out of /v1/vms entirely.
+        for bad in ["../secrets", "a/b", "vm%2f..", "", "with space"] {
+            assert!(
+                safe_vm_id(bad).is_err(),
+                "{bad:?} was accepted into a url path"
+            );
+        }
+        for good in ["vm-1", "hib-demo", "a_b.c"] {
+            assert!(safe_vm_id(good).is_ok(), "{good:?} was refused");
+        }
+    }
 
     fn write_token(dir: &Path, contents: &str) -> PathBuf {
         let creds = dir.join("credentials");
@@ -306,6 +351,64 @@ impl CoordinatorClient {
     /// Running microVMs.
     pub async fn vms(&self) -> Result<serde_json::Value, CoordinatorError> {
         self.get_json("/v1/vms").await
+    }
+
+    /// What this machine can run: live tiers, images, and remaining capacity.
+    ///
+    /// Two calls in one command, because a controller needs both and asking
+    /// twice over the control channel would double the round trips on the one
+    /// question every machine is asked. `/v1/setup` is best effort: a
+    /// coordinator older than that endpoint reports no setup, which is not the
+    /// same as a host that needs nothing and must not render as one.
+    pub async fn offering(&self) -> Result<serde_json::Value, CoordinatorError> {
+        let offering = self.get_json("/v1/offering").await?;
+        let setup = self.get_json("/v1/setup").await.ok();
+        Ok(serde_json::json!({ "offering": offering, "setup": setup }))
+    }
+
+    /// Start a microVM from an image this machine advertised.
+    ///
+    /// The body is passed through VERBATIM. It was built by shared Rust on the
+    /// controller from the same offering this coordinator published, and
+    /// rewriting it here would give the two sides two different ideas of what
+    /// was asked for. The coordinator validates it again regardless -- it does
+    /// not trust the controller's copy either.
+    pub async fn launch_vm(&self, body: &str) -> Result<serde_json::Value, CoordinatorError> {
+        // Parsed only to reject a malformed body before a round trip; the
+        // original text is what gets sent.
+        let _: serde_json::Value =
+            serde_json::from_str(body).map_err(|e| CoordinatorError::Malformed(e.to_string()))?;
+        let reply = self
+            .send(
+                self.http
+                    .post(self.url("/v1/launch"))
+                    .header("content-type", "application/json")
+                    .body(body.to_owned()),
+            )
+            .await?;
+        serde_json::from_str(&reply).map_err(|e| CoordinatorError::Malformed(e.to_string()))
+    }
+
+    /// Write a running microVM to disk and stop it.
+    ///
+    /// Returns what the coordinator wrote -- both paths and the memory file's
+    /// size -- rather than an acknowledgement. A caller that only saw "ok"
+    /// could not tell a real snapshot from a plausible one.
+    pub async fn hibernate_vm(&self, id: &str) -> Result<serde_json::Value, CoordinatorError> {
+        let id = safe_vm_id(id)?;
+        let body = self
+            .send(self.http.post(self.url(&format!("/v1/vms/{id}/hibernate"))))
+            .await?;
+        serde_json::from_str(&body).map_err(|e| CoordinatorError::Malformed(e.to_string()))
+    }
+
+    /// Wake a hibernated microVM from its snapshot.
+    pub async fn resume_vm(&self, id: &str) -> Result<serde_json::Value, CoordinatorError> {
+        let id = safe_vm_id(id)?;
+        let body = self
+            .send(self.http.post(self.url(&format!("/v1/vms/{id}/resume"))))
+            .await?;
+        serde_json::from_str(&body).map_err(|e| CoordinatorError::Malformed(e.to_string()))
     }
 
     /// Answer a secret request.

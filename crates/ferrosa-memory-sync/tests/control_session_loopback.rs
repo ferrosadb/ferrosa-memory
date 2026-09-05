@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use ferrosa_memory_core::remote_identity::{InstanceId, InstanceSigningIdentity};
 use ferrosa_memory_sync::control_session::{
-    ControlSessionConfig, run_control_controller_session, run_control_server_session,
+    ControlSessionConfig, ControlSessionError, run_control_controller_session,
+    run_control_server_session,
 };
 use ferrosa_memory_sync::signaling_client::{
     BrokerSignal, ControlBrokerSessionView, ControlSignalingApi, SignalingClientError,
@@ -257,4 +258,13 @@ async fn direct_control_bind_and_ping_pong() {
         controller.recv_text().await.expect("receive pong"),
         r#"{"version":1,"body":{"type":"pong"}}"#
     );
+
+    controller.close().await.expect("close controller");
+    let disconnected = tokio::time::timeout(Duration::from_secs(5), server.recv_text())
+        .await
+        .expect("server receive must wake when the peer closes");
+    assert!(matches!(
+        disconnected,
+        Err(ControlSessionError::ChannelClosed)
+    ));
 }

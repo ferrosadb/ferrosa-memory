@@ -26,7 +26,9 @@
 //! interfaces. The fingerprint binding is real today; only the *source* (DTLS
 //! vouch) is deferred.
 
+pub mod artifact_view;
 pub mod codex_runtime;
+pub mod control_frame;
 #[cfg(feature = "webrtc-transport")]
 pub mod control_session;
 pub mod coordinator_client;
@@ -46,6 +48,8 @@ pub mod peer_cli;
 pub mod peer_session;
 pub mod peer_transport;
 pub mod replication;
+/// When to try a refused dependency again, instead of caching the refusal.
+mod retry_gate;
 pub mod rules_view;
 pub mod session_config;
 /// Runs a configured session and carries its text both ways.

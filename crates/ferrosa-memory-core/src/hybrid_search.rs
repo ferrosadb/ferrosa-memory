@@ -720,13 +720,22 @@ fn apply_source_aware_scoring(
         return results;
     }
     let bibliographic = bibliographic_query(&query_terms);
+    // Dropping an ANN-only candidate is a statement that a lexical source looked
+    // at this query and did NOT corroborate it. When no lexical source produced a
+    // single candidate for the whole query there is no such statement to make --
+    // the lexical channel is absent, not dissenting. Applying the drop anyway
+    // discards every candidate and turns a healthy fan-out into an empty result
+    // (t_9a6cffe3: 20 candidates from entity_ann/document_ann, 0 results, on an
+    // install whose embedding index was correctly stamped). Demote instead: the
+    // ann_only_penalty below still ranks these last if anything else shows up.
+    let lexical_corroboration_available = evidence.values().any(|ev| ev.lexical_sources > 0);
     let mut scored = Vec::with_capacity(results.len());
     for mut result in results {
         let Some(ev) = evidence.get(&result.id) else {
             scored.push(result);
             continue;
         };
-        if ev.ann_only_without_terms() {
+        if lexical_corroboration_available && ev.ann_only_without_terms() {
             continue;
         }
         let source_bonus = (ev.source_count().saturating_sub(1) as f64 * 0.035).min(0.14);
@@ -4089,5 +4098,99 @@ mod tests {
 
         assert!(frontier.is_empty());
         assert!(signals.is_empty());
+    }
+
+    /// Fresh-install regression (t_9a6cffe3): every candidate came from an ANN
+    /// source because no lexical source produced anything, and every one of them
+    /// was then DISCARDED by the ann-only guard -- so a search over freshly
+    /// ingested, correctly embedded content returns zero while the diagnostics
+    /// report a healthy fan-out.
+    ///
+    /// The guard exists to suppress ANN noise when lexical evidence is available
+    /// to corroborate it. When no lexical source produced a single candidate for
+    /// this query there is nothing to corroborate against, and dropping the whole
+    /// ANN set degrades silently to "found nothing" instead of returning the
+    /// semantically nearest content. Demote, do not delete.
+    #[tokio::test]
+    async fn ann_only_candidates_survive_when_no_lexical_source_produced_anything() {
+        use crate::storage::mock::MockStorage;
+        use crate::types::{EntityEntry, MemoryState, TenantContext};
+
+        let storage = MockStorage::new();
+        let ctx = TenantContext {
+            tenant_id: Uuid::new_v4(),
+            session_origin: "test".into(),
+        };
+        let sid = Uuid::new_v4();
+
+        // Content with NO token overlap with the query, so lexical_hits == 0 for
+        // every candidate. The mock's phonetic search is a name substring match,
+        // so these names keep every lexical source empty -- exactly the observed
+        // "candidate sources that produced anything: entity_ann" shape.
+        for name in ["Alpha Runbook", "Beta Runbook", "Gamma Runbook"] {
+            storage
+                .entity_put(
+                    &ctx,
+                    &EntityEntry {
+                        tenant_id: ctx.tenant_id,
+                        entity_id: Uuid::new_v4(),
+                        session_id: sid,
+                        entity_name: name.into(),
+                        entity_type: "note".into(),
+                        source_fold_id: None,
+                        context_snippet: format!("{name} describes an unrelated topic"),
+                        entity_embedding: Some(vec![0.1, 0.2, 0.3]),
+                        confidence: 1.0,
+                        state: MemoryState::Active,
+                        created_at: chrono::Utc::now(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let query_embedding = vec![0.1_f32, 0.2, 0.3];
+        let output = hybrid_search_with_diagnostics(
+            &storage,
+            &ctx,
+            sid,
+            "deferred work",
+            Some(&query_embedding),
+            5,
+            None,
+            None,
+            None,
+            &FusionConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output.diagnostics.total_candidates > 0,
+            "precondition: the ANN source must have produced candidates"
+        );
+        assert!(
+            output
+                .diagnostics
+                .sources
+                .iter()
+                .all(|source| source_is_ann(&source.source)),
+            "precondition: only ANN sources produced candidates, got {:?}",
+            output
+                .diagnostics
+                .sources
+                .iter()
+                .map(|source| source.source.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !output.results.is_empty(),
+            "a search with {} candidates and no lexical source to corroborate them \
+             must not return zero results -- that is a silent degradation, not a \
+             genuine miss",
+            output.diagnostics.total_candidates
+        );
     }
 }

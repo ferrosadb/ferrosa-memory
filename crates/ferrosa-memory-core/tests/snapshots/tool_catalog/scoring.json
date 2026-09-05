@@ -1,0 +1,50 @@
+[
+  {
+    "name": "importance",
+    "description": "Computes a 4-channel importance score for a memory entity: novelty (how surprising), arousal (emotional intensity), reward (past retrieval success), attention (recency/frequency).\n\nCALL WHEN: Prioritizing which memories to surface, deciding whether to consolidate or prune, or ranking retrieval results by relevance.\nRETURNS: Per-channel scores (0-1) and a weighted composite score.\nCost: ~5ms.",
+    "inputSchema": {
+      "properties": {
+        "entity_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

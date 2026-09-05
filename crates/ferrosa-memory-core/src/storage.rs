@@ -2039,6 +2039,47 @@ pub trait Storage: Send + Sync {
         ctx: &TenantContext,
         session_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<ConsolidationRun>>> + Send;
+
+    /// Whether note-share records are durably persisted by this backend.
+    /// In-memory test stores deliberately return false; the CQL backend
+    /// overrides this and implements the four persistence operations below.
+    fn note_share_persistence_enabled(&self) -> bool {
+        false
+    }
+
+    fn note_share_persist(
+        &self,
+        _owner_account_id: Uuid,
+        _share: &crate::note_share::NoteShare,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async { anyhow::bail!("note-share persistence is unavailable") }
+    }
+
+    fn note_share_load(
+        &self,
+        _share_id: Uuid,
+    ) -> impl std::future::Future<
+        Output = anyhow::Result<Option<(Uuid, crate::note_share::NoteShare)>>,
+    > + Send {
+        async { anyhow::bail!("note-share persistence is unavailable") }
+    }
+
+    fn note_share_audit_read(
+        &self,
+        _share_id: Uuid,
+        _recipient_account_id: Uuid,
+        _result: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async { anyhow::bail!("note-share persistence is unavailable") }
+    }
+
+    fn note_share_revoke_durable(
+        &self,
+        _share_id: Uuid,
+        _owner_account_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        async { anyhow::bail!("note-share persistence is unavailable") }
+    }
 }
 
 /// Live cluster metadata sourced from the ferrosa CQL system tables. All

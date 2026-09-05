@@ -108,7 +108,7 @@ jobs:
       # The `--all-targets` build above already compiled these test binaries, so
       # `nextest archive` is cache-warm and just packages them.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: nextest
       - name: Archive test binaries (built once, run in integration)
@@ -141,14 +141,16 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-llvm-cov
       - name: Run tests with coverage
         run: |
           # Exclude: test files, mock storage, infrastructure needing live services
-          # (CQL storage, MCP/batch binaries, HTTP server, graph/embedding clients)
-          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
+          # (CQL storage, MCP/batch binaries, HTTP server, graph/embedding clients,
+          # and real WebRTC sessions). The WebRTC paths are exercised by the
+          # ignored ICE/DTLS/SCTP loopback tests in the integration job below.
+          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs|control_session\.rs|peer_session\.rs|peer_transport_webrtc\.rs)'
           # Skip integration tests entirely from the coverage pass — they
           # panic-loud on missing FERROSA_TEST_CQL_PORT (per fmem CLAUDE.md
           # policy: tests requiring a cluster must `panic!` rather than
@@ -160,7 +162,7 @@ jobs:
             --ignore-filename-regex "$EXCL"
       - name: Coverage summary
         run: |
-          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
+          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs|control_session\.rs|peer_session\.rs|peer_transport_webrtc\.rs)'
           cargo llvm-cov --workspace \
             --ignore-filename-regex "$EXCL" \
             --no-run 2>/dev/null || true
@@ -171,7 +173,7 @@ jobs:
           path: lcov.info
       - name: Check coverage threshold (80% line)
         run: |
-          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs)'
+          EXCL='(tests/|test_|_test\.rs|mock|cql_storage\.rs|main\.rs|http\.rs|graph\.rs|embedding\.rs|control_session\.rs|peer_session\.rs|peer_transport_webrtc\.rs)'
           TOTAL=$(cargo llvm-cov --workspace \
             --ignore-filename-regex "$EXCL" \
             --no-run --json 2>/dev/null | \
@@ -328,7 +330,7 @@ jobs:
           shared-key: ws-noinstrument
           cache-on-failure: false
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: nextest
       - name: Download prebuilt test-binary archive (from the build job)

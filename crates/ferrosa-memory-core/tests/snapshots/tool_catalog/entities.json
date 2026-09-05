@@ -1,0 +1,830 @@
+[
+  {
+    "name": "upsert",
+    "description": "Writes a discovered named entity to the entity store. Deduplicates via phonetic matching.\n\nCALL WHEN: Any time you identify a named entity (person, place, org, event, concept) from content.\nCheck is_new in response: if false, entity already exists — use the returned entity_id to attach new facts.\n\nNote: source_fold_id is optional — omit if not in a fold context.",
+    "inputSchema": {
+      "properties": {
+        "confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "context_snippet": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "embedding": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "entity_name": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "entity_type": {
+          "enum": [
+            "person",
+            "place",
+            "organization"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "source_fold_id": {
+          "description": "Optional: fold UUID from start_fold. Omit if not in a fold context.",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_name",
+        "entity_type",
+        "context_snippet"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "ingest_batch",
+    "description": "Batch ingest multiple entities in a single call.\n\nCALL WHEN:\n- Ingesting 5+ entities at once (codebase indexing, document extraction, bulk import)\n- Performance matters — single round-trip instead of N sequential calls\n\nEach entity follows the same schema as upsert_entity. Returns array of results.\n\nCost: ~15ms + 5ms per entity (vs 15ms per entity with individual calls).",
+    "inputSchema": {
+      "properties": {
+        "entities": {
+          "description": "Array of entities to ingest",
+          "items": {
+            "properties": {
+              "confidence": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "context_snippet": {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "entity_name": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "entity_type": {
+                "enum": [
+                  "person",
+                  "place",
+                  "organization"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "entity_name",
+              "entity_type",
+              "context_snippet"
+            ],
+            "type": "object"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "session_id": {
+          "description": "Session UUID",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entities"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "entities_update",
+    "description": "Batch update entities by entity_id with explicit patch fields.\n\nReturns per-row success/failure and supports partial update.",
+    "inputSchema": {
+      "properties": {
+        "entities": {
+          "description": "Array of entity patches keyed by entity_id",
+          "items": {
+            "properties": {
+              "confidence": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "context_snippet": {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "description": {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "embedding": {
+                "description": "Replacement embedding vector",
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              "entity_id": {
+                "type": "string"
+              },
+              "entity_name": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "entity_type": {
+                "type": "string"
+              },
+              "properties": {
+                "type": "object"
+              },
+              "source_fold_id": {
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "active",
+                  "dormant",
+                  "silent",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "entity_id"
+            ],
+            "type": "object"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entities"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "entities_delete",
+    "description": "Batch delete entities by id with per-row success/failure reporting. Existing rows are hard-deleted from ferrosa-memory owned storage.",
+    "inputSchema": {
+      "properties": {
+        "entities": {
+          "description": "Entity IDs to delete",
+          "items": {
+            "properties": {
+              "entity_id": {
+                "description": "Target entity UUID",
+                "type": "string"
+              }
+            },
+            "required": [
+              "entity_id"
+            ],
+            "type": "object"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entities"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "ingest_many",
+    "description": "Bulk-ingest entities and typed edges in a single call. The server owns schema mapping, conflict semantics, optional embedding generation, and structured per-row failures.\n\nCALL WHEN: You already have a batch of stable entity IDs and typed edges and want one fail-loud ingest call instead of direct CQL writes or multiple tool calls.\nRETURNS: counts plus structured failed[] arrays for entities, edges, and embeddings. dry_run validates without writing.",
+    "inputSchema": {
+      "properties": {
+        "edges": {
+          "items": {
+            "properties": {
+              "dst_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "edge_type": {
+                "type": "string"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "src_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "weight": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "src_id",
+              "dst_id",
+              "edge_type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "entities": {
+          "items": {
+            "properties": {
+              "attrs": {
+                "type": "object"
+              },
+              "confidence": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "context": {
+                "maxLength": 16384,
+                "type": "string"
+              },
+              "embedding": {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              "entity_type": {
+                "enum": [
+                  "person",
+                  "place",
+                  "organization"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "name": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "entity_type",
+              "context"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "options": {
+          "properties": {
+            "dry_run": {
+              "type": "boolean"
+            },
+            "embed_missing": {
+              "type": "boolean"
+            },
+            "embedding_model": {
+              "type": "string"
+            },
+            "on_conflict": {
+              "enum": [
+                "update",
+                "skip",
+                "error"
+              ],
+              "type": "string"
+            },
+            "strict_edges": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "entities"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "find",
+    "description": "Retrieves named entities by name (phonetic fuzzy match), semantic similarity (ANN), or both.\n\nCALL WHEN: Need to find entities related to current query. Use strategy='phonetic' for known names with possible variants. Use strategy='ann' for semantic search. Use strategy='both' for maximum recall.\nCost: phonetic ~5ms, ann ~10ms, both ~15ms.",
+    "inputSchema": {
+      "properties": {
+        "embedding": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "k": {
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "strategy": {
+          "enum": [
+            "ann",
+            "phonetic",
+            "both"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "note_share_create",
+    "description": "Create an owner-authoritative, read-only note share. The recipient account is bound at creation; shares default to seven days and cannot be re-shared. Only a frozen summary is copied; live notes stay on the owner server.",
+    "inputSchema": {
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "frozen_summary": {
+          "maxLength": 65536,
+          "type": "string"
+        },
+        "note_id": {
+          "type": "string"
+        },
+        "recipient_account_id": {
+          "type": "string"
+        },
+        "successful_read_limit": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "note_id",
+        "recipient_account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "note_share_read",
+    "description": "Read a note through an accepted share. Authorization, expiry, revocation, and the successful-read budget are checked on the owner server; a budget is consumed only after the content is delivered.",
+    "inputSchema": {
+      "properties": {
+        "entitlement": {
+          "description": "Owner-signed NoteShareEntitlement envelope returned after activation acceptance",
+          "type": "object"
+        },
+        "owner_public_identity": {
+          "description": "Owner instance public identity used to verify the entitlement",
+          "type": "object"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "share_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "share_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "note_share_revoke",
+    "description": "Immediately revoke a note share. Only the account that created the share can revoke it.",
+    "inputSchema": {
+      "properties": {
+        "share_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "share_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list",
+    "description": "List entities with structured equality predicates over entity fields and properties. Use this for kanban/task-style queries such as all task entities with status=ready and assignee=claude; use hybrid_search for semantic recall.",
+    "inputSchema": {
+      "properties": {
+        "entity_type": {
+          "description": "Optional entity_type filter, e.g. task",
+          "type": "string"
+        },
+        "filters": {
+          "description": "Equality predicates. Known entity fields include entity_id/id, session_id, entity_name/name, entity_type, state, scope, tags, content_hash, confidence. Other keys match properties.<key>.",
+          "type": "object"
+        },
+        "include_cross_session": {
+          "description": "Compatibility flag. true is equivalent to scope=all; false is equivalent to scope=session when scope is omitted and requires session_id.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max results to return (default 50)",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "description": "session=the supplied session_id; global=tenant global plus legacy nil session; both=session+global; all=tenant-wide scan. Default all; session_id alone never changes scope.",
+          "enum": [
+            "session",
+            "global",
+            "both",
+            "all"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session UUID to target only with scope=session. Supplying it alone does not change the tenant-wide default.",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "duplicates",
+    "description": "Scans a session's entities for potential duplicates using text similarity (Jaccard coefficient) on context snippets. Returns pairs above the threshold, sorted by similarity descending.\n\nCALL WHEN: After bulk entity ingestion, or when you suspect duplicate entities exist in a session. Useful before consolidation to identify merge candidates.\nDO NOT CALL: On sessions with very few entities (< 3). Use retrieve_entities with phonetic matching for single-entity dedup.\nCost: O(n^2) comparisons -- fast for <1000 entities per session.",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Similarity threshold (0-1). Default: 0.7. Higher = fewer, more confident matches.",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

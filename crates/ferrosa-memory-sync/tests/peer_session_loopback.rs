@@ -349,12 +349,11 @@ async fn full_consent_bind_transfer_through_the_mock_broker() {
         .await
     });
 
-    let report = teacher_task
-        .await
+    let (teacher_result, learner_result) = tokio::join!(teacher_task, learner_task);
+    let report = teacher_result
         .expect("teacher join")
-        .expect("teacher session");
-    let health = learner_task
-        .await
+        .unwrap_or_else(|error| panic!("teacher session: {error:?}; learner: {learner_result:?}"));
+    let health = learner_result
         .expect("learner join")
         .expect("learner session");
 

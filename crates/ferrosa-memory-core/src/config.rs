@@ -68,6 +68,15 @@ pub struct ConsolidationConfig {
     /// Poll interval for pending consolidation requests, in seconds (default: 20).
     #[serde(default = "default_consolidation_poll_seconds")]
     pub poll_seconds: u64,
+    /// Longest the sweep may stretch to while the queue stays empty, in
+    /// seconds (default: 300).
+    ///
+    /// Each poll is a full ring scan whether or not there is work, so an idle
+    /// deployment on a fixed interval pays that scan forever. Capped rather
+    /// than unbounded: a queue that went quiet overnight must still notice the
+    /// morning's first request promptly.
+    #[serde(default = "default_consolidation_poll_idle_max_seconds")]
+    pub poll_idle_max_seconds: u64,
     /// Lease duration granted to a worker; must exceed expected run time (default: 300).
     #[serde(default = "default_consolidation_lease_seconds")]
     pub lease_seconds: u64,
@@ -88,12 +97,17 @@ impl Default for ConsolidationConfig {
         Self {
             enabled: true,
             poll_seconds: default_consolidation_poll_seconds(),
+            poll_idle_max_seconds: default_consolidation_poll_idle_max_seconds(),
             lease_seconds: default_consolidation_lease_seconds(),
             stale_edge_max_days: 0,
             edge_decay_factor: default_decay_factor(),
             min_interval_seconds: default_consolidation_min_interval_seconds(),
         }
     }
+}
+
+fn default_consolidation_poll_idle_max_seconds() -> u64 {
+    300
 }
 
 fn default_consolidation_poll_seconds() -> u64 {

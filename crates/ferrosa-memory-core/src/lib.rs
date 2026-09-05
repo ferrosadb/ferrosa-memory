@@ -19,6 +19,7 @@
 //!
 //! Shared library for the Ferrosa Memory MCP system.
 
+pub mod artifact;
 pub mod audit;
 pub mod auth;
 pub mod batch;
@@ -59,8 +60,10 @@ pub mod migration;
 pub mod migration_backfill;
 pub mod migration_backfill_cql;
 pub mod ner;
+pub mod note_share;
 pub mod pagerank;
 pub mod plan;
+pub mod poll_backoff;
 pub mod promotion;
 pub mod quota;
 pub mod reconcile;
