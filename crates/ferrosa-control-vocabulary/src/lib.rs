@@ -376,6 +376,8 @@ mod tests {
                     | Command::VmLaunch
                     | Command::VmHibernate
                     | Command::VmResume
+                    | Command::VmStop
+                    | Command::VmArchive
                     | Command::CoordinatorOffer
             );
             assert_eq!(
