@@ -933,6 +933,10 @@ fn t12_every_created_table_is_granted_or_explicitly_exempt() {
         "routing_guidelines",
         "query_heat_by_predicate_day",
         "compute_cost_by_predicate_day",
+        // Read-only at runtime: artifact_view.rs does a single SELECT against
+        // it to check reviewer membership. Nothing writes it on the serving
+        // path, so a MODIFY grant would widen the runtime role for no reason.
+        "artifact_reviewer",
     ];
 
     let roles = ROLES_DDL.to_lowercase();
