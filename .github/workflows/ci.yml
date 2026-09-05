@@ -857,22 +857,27 @@ jobs:
         # different repository), not the disposable CI cluster. It remains
         # available for an explicit local `--test task_board_live -- --ignored`
         # run against that external board.
+        # `--run-ignored all`, not `ignored-only`. With `ignored-only` this step
+        # ran ONLY #[ignore]d tests, while `Tests & Coverage` uses
+        # `--lib --bins`, which excludes tests/ binaries entirely. Between them
+        # every non-ignored integration test fell through the gap: 167 of the
+        # workspace's 189 tests in tests/*.rs were executed by no job.
+        #
+        # That is how t12_every_created_table_is_granted_or_explicitly_exempt
+        # -- the guard against the entity_store grant incident, where writes
+        # fail silently under auth because the runtime role lacks MODIFY -- sat
+        # failing on a branch whose eleven checks were all green.
+        #
+        # The comments live HERE, above `run:`, and not inside the command. A
+        # `#` line inside a backslash continuation ENDS it: the shell ran
+        # `cargo nextest run --archive-file ... --workspace-remap .` on its own,
+        # silently dropping the filterset, and then tried to execute
+        # `--run-ignored` as a command (exit 127). It reported 2534 tests
+        # passing while doing the wrong thing, which is worse than failing.
         run: |
           cargo nextest run \
             --archive-file nextest-archive.tar.zst \
             --workspace-remap . \
-          # `all`, not `ignored-only`. With `ignored-only` this step ran ONLY
-          # #[ignore]d tests, while `Tests & Coverage` uses `--lib --bins`,
-          # which excludes tests/ binaries entirely. Between them every
-          # non-ignored integration test fell through the gap: 167 of the
-          # workspace's 189 tests in tests/*.rs were executed by no job.
-          #
-          # That is how t12_every_created_table_is_granted_or_explicitly_exempt
-          # -- the guard against the entity_store grant incident, where writes
-          # fail silently under auth because the runtime role lacks MODIFY --
-          # sat failing on a branch whose eleven checks were all green.
-          #
-          # This step owns the live cluster, so it is the right place for them.
             --run-ignored all \
             --filterset 'not (package(ferrosa-memory-core) and binary(migration_drift) and test(t10_fresh_keyspace_applies_every_registered_migration)) and not (package(ferrosa-memory-sync) and binary(task_board_live))' \
             --no-fail-fast
