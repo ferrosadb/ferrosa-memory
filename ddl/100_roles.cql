@@ -135,4 +135,34 @@ GRANT MODIFY ON agent_memory.tier_root_alias TO ferrosa_user;
 GRANT MODIFY ON agent_memory.tier_root_rule  TO ferrosa_user;
 GRANT MODIFY ON agent_memory.tier_promotion  TO ferrosa_user;
 
+-- Knowledge items (migration 055+): the knowledge tier's own store and its
+-- state/expiry/version views. Every one is written on the serving path by
+-- ingest and the promotion pipeline.
+GRANT MODIFY ON agent_memory.knowledge_item      TO ferrosa_user;
+GRANT MODIFY ON agent_memory.knowledge_version   TO ferrosa_user;
+GRANT MODIFY ON agent_memory.knowledge_by_state  TO ferrosa_user;
+GRANT MODIFY ON agent_memory.knowledge_by_expiry TO ferrosa_user;
+
+-- Entity source by root: the reverse index over entity_source, written in the
+-- same ingest transaction. entity_source was granted for migration 054 and
+-- this view was missed.
+GRANT MODIFY ON agent_memory.entity_source_by_root TO ferrosa_user;
+
+-- Artifact upload: blobs, their state view, links, tags and approvals are all
+-- written on the serving path when an artifact is uploaded or reviewed.
+-- artifact_reviewer is deliberately absent -- it is read-only at runtime
+-- (a single SELECT in artifact_view.rs) and is listed in the test's
+-- NO_RUNTIME_WRITE instead.
+GRANT MODIFY ON agent_memory.artifact_blob     TO ferrosa_user;
+GRANT MODIFY ON agent_memory.artifact_by_state TO ferrosa_user;
+GRANT MODIFY ON agent_memory.artifact_link     TO ferrosa_user;
+GRANT MODIFY ON agent_memory.artifact_tag      TO ferrosa_user;
+GRANT MODIFY ON agent_memory.artifact_approval TO ferrosa_user;
+
+-- Note sharing: entitlements are written when a share is granted or revoked,
+-- the audit row on every access, and the read counter is UPDATEd per read.
+GRANT MODIFY ON agent_memory.note_share_entitlements  TO ferrosa_user;
+GRANT MODIFY ON agent_memory.note_share_audit         TO ferrosa_user;
+GRANT MODIFY ON agent_memory.note_share_read_counters TO ferrosa_user;
+
 -- graph-owned tables: NOT GRANTED to ferrosa_user on purpose.
