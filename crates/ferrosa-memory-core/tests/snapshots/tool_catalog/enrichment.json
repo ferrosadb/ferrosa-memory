@@ -1,0 +1,71 @@
+[
+  {
+    "name": "enrich",
+    "description": "Post-ingest enrichment: generates LLM descriptions for code entities, annotates edge relationships, and lints the knowledge graph.\n\nCALL WHEN: After frg ingest populates the graph with structural entities. Transforms shallow structural facts into searchable semantic knowledge.\n\nOperations: enrich (LLM descriptions), annotate (edge explanations), lint (graph analysis).\nIdempotent — safe to run multiple times. Already-enriched entities are skipped.\nCost: ~2-5 min for 1000 entities (local LLM). Lint is instant.",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "description": "Lint only, don't write changes. Default: false.",
+          "type": "boolean"
+        },
+        "entity_types": {
+          "description": "Filter: only enrich entities of these types",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "force": {
+          "description": "Re-enrich already-enriched entities. Default: false.",
+          "type": "boolean"
+        },
+        "operations": {
+          "description": "Which operations to run. Default: all three.",
+          "items": {
+            "enum": [
+              "enrich",
+              "annotate",
+              "lint"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

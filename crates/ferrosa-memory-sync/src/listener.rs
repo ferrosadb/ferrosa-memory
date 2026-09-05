@@ -218,6 +218,7 @@ pub trait SessionExtension: Send + Sync {
 #[derive(Clone)]
 pub struct SessionHandle {
     session_id: uuid::Uuid,
+    controller_device_id: uuid::Uuid,
     peer: std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
     sink: crate::control_session::ControlFrameSink,
 }
@@ -226,6 +227,13 @@ impl SessionHandle {
     /// Which session this is.
     pub fn session_id(&self) -> uuid::Uuid {
         self.session_id
+    }
+
+    /// The controller device authenticated by the broker for this session.
+    /// Extensions use this as the stable actor identity for writes; request
+    /// bodies must not be allowed to replace it.
+    pub fn controller_device_id(&self) -> uuid::Uuid {
+        self.controller_device_id
     }
 
     /// The peer connection, for attaching what this crate does not model.
@@ -401,11 +409,12 @@ pub async fn run_control_listener(
             // phone needing a route to the database or a credential for it.
             memory_config.ferrosa.contact_points.clone(),
             configured_tenant.or_else(|| memory_tenant(memory_config.server.tenant_id.as_deref())),
+            Arc::clone(&identity),
         ),
     ));
 
-    if extensions.any() {
-        println!("{} session extension(s) attached", extensions.attach.len());
+    if !hooks.is_empty() {
+        println!("{} session extension(s) attached", hooks.len());
     } else {
         // Said out loud. A plain control session is the normal case for the
         // public binary, and silence would leave an operator unable to tell
@@ -549,6 +558,7 @@ async fn serve_control_session<S, R, T>(
     let peer_state = watch_peer_state(&channel.peer_connection());
     let handle = SessionHandle {
         session_id: offer.session_id,
+        controller_device_id: offer.controller_device_id,
         peer: channel.peer_connection(),
         sink: channel.frame_sink(),
     };
@@ -998,6 +1008,7 @@ fn frame_priority(kind: &str) -> FramePriority {
         | "shell_knowledge_decide"
         | "shell_memory_tiers"
         | "shell_memory_items"
+        | "shell_memory_item"
         | "shell_tasks"
         | "shell_task"
         | "shell_task_search"
@@ -1938,6 +1949,7 @@ mod tests {
         for kind in [
             "shell_memory_tiers",
             "shell_memory_items",
+            "shell_memory_item",
             "shell_tasks",
             "shell_task",
             "shell_task_search",

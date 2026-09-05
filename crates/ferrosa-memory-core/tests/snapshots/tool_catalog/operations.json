@@ -1,0 +1,395 @@
+[
+  {
+    "name": "stats",
+    "description": "Returns memory system statistics. Entity/node and edge counts are tenant-wide by default. Use scope=session with session_id to scope both counts to one session.\n\nCALL WHEN: For health monitoring, debugging, or when the user asks about memory usage.\nCost: ~5ms (runs count queries).",
+    "inputSchema": {
+      "properties": {
+        "scope": {
+          "description": "tenant is the default; session scopes all counts to the supplied session_id.",
+          "enum": [
+            "tenant",
+            "session"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session UUID required when scope=session. Supplying it alone does not change the tenant-wide default.",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "metrics",
+    "description": "Returns a compact tenant-wide memory size report: total node/edge counts plus node and edge buckets, including legacy nil-session knowledge in the tenant totals.\n\nCALL WHEN: A user asks how much knowledge is stored, how many nodes/edges memory has, or whether database-backed memory has outgrown flat files.\nCost: ~10-100ms (tenant-scoped count queries).",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "migrations",
+    "description": "Returns read-only schema migration status for the connected memory database: db_version, binary_version, pending versions, and last applied timestamp.\n\nCALL WHEN: Startup logs or graph writes suggest schema drift, or an operator asks whether the database schema is current.\nCost: ~5ms.",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "describe",
+    "description": "Read-only, management-safe self-description of this ferrosa-memory server (contract ferrosa-memory.system.describe.v1): identity, runtime health, redacted effective config, dependent-store health, live ferrosa cluster info (queried from the CQL system tables), summary memory statistics, schema drift, binary/release state, capabilities, and allowed management actions.\n\nCALL WHEN: A management client (e.g. Ferrosa Workbench) discovers or is pointed at this endpoint and needs the authoritative cluster descriptor instead of inferring it from local files. Secrets are never returned; their key paths appear under configuration.redactedKeys.\nCost: ~10-3000ms (bounded dependency probes).",
+    "inputSchema": {
+      "properties": {
+        "caller": {
+          "description": "Optional calling client identity, logged for diagnostics.",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "include": {
+          "description": "Optional list of sections to return. Omit for all sections.",
+          "items": {
+            "enum": [
+              "identity",
+              "runtime",
+              "configuration",
+              "stores",
+              "schema",
+              "statistics",
+              "binaries",
+              "harnesses",
+              "capabilities",
+              "managementActions"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "redaction": {
+          "description": "Redaction mode. Only management-safe is supported; secrets are always redacted.",
+          "enum": [
+            "management-safe"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session to scope the statistics section to (defaults to the nil session).",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "forget",
+    "description": "Candidate-confirmed forgetting, in two phases. PROPOSE (pass `query`, no token): searches memory across sessions for candidates matching the intent, returns each candidate's blast radius (edges/temporal/derived it references) plus a signed `forget_token` — mutates nothing. CONFIRM (pass `forget_token` + `selected_ids` + `confirm: true`): forgets only the approved ids. Defaults to reversible RETRACT (excluded from recall, audited, restorable via restore_forgotten for `retract_purge_days`); pass `mode: \"hard\"` for permanent deletion. Never forgets without explicit confirmation; skips any candidate that changed since proposal.\n\nCALL WHEN: the user asks to forget/remove specific memories. Always propose first, show the candidates, and only confirm the ids the user approves — never pass confirm:true on the user's behalf.\nCost: propose ~20ms + search; confirm ~10-50ms per item.",
+    "inputSchema": {
+      "properties": {
+        "acknowledge_high_impact": {
+          "description": "Required to forget a high-impact (highly-connected) candidate.",
+          "type": "boolean"
+        },
+        "confirm": {
+          "description": "Must be true (with forget_token) to execute the forget.",
+          "type": "boolean"
+        },
+        "forget_token": {
+          "description": "Confirm phase: the token returned by a prior propose call.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Max candidates to propose.",
+          "type": "integer"
+        },
+        "mode": {
+          "description": "retract (default, reversible) or hard (permanent).",
+          "enum": [
+            "retract",
+            "hard"
+          ],
+          "type": "string"
+        },
+        "query": {
+          "description": "Propose phase: natural-language description of what to forget.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "scope": {
+          "description": "Optional candidate filters (entity types, etc.).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "selected_ids": {
+          "description": "Confirm phase: the candidate ids the user approved.",
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "restore",
+    "description": "Reverse a retraction: restore a soft-forgotten entity to its prior memory state so it is recalled again. Works only for retract-mode forgets that have not yet been purged (within retract_purge_days); hard deletes are irreversible. Note: edges removed at forget time are not auto-recreated in v1.\n\nCALL WHEN: the user wants to undo a forget / bring back a retracted memory.\nCost: ~10ms.",
+    "inputSchema": {
+      "properties": {
+        "entity_id": {
+          "description": "The entity to restore.",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "type_counts",
+    "description": "Return an entity histogram broken down by entity_type, by state, and by the joint (type,state) buckets. Counts are tenant-wide by default. Use scope=session with session_id to scope the histogram to one session.\n\nCALL WHEN: You need status/diagnostic counts like 'how many bugs are active in this session?' without coupling the client to entity_store columns.\nCost: ~5-10ms.",
+    "inputSchema": {
+      "properties": {
+        "scope": {
+          "description": "tenant is the default; session scopes the histogram to the supplied session_id.",
+          "enum": [
+            "tenant",
+            "session"
+          ],
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session UUID required when scope=session. Supplying it alone does not change the tenant-wide default.",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

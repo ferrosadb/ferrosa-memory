@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/fmem-cli", "crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch", "crates/ferrosa-memory-sync", "crates/ferrosa-memory-eval"]
+members = ["crates/ferrosa-control-vocabulary", "crates/fmem-cli", "crates/ferrosa-memory-core", "crates/ferrosa-memory-mcp", "crates/ferrosa-memory-batch", "crates/ferrosa-memory-sync", "crates/ferrosa-memory-eval"]
 resolver = "2"
 
 [workspace.package]
-version = "0.29.1"
+version = "0.29.2"
 edition = "2024"
 license = "Apache-2.0"
 

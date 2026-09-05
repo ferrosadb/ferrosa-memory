@@ -26,6 +26,20 @@ pub enum CoordinatorCommand {
     SecretDeny,
     /// List running microVMs.
     VmList,
+    /// Report what this machine's coordinator can run: which runtime tiers are
+    /// live, what images it holds, and how much room is left.
+    ///
+    /// A read, and the one a controller issues before it can offer anything at
+    /// all. It replaced typing an address into the app: a coordinator listens
+    /// on loopback and is reached by the listener beside it, so nothing off the
+    /// machine needs a port.
+    CoordinatorOffer,
+    /// Start a microVM from an image the machine advertised.
+    VmLaunch,
+    /// Write a running microVM to disk and stop it.
+    VmHibernate,
+    /// Wake a hibernated microVM from its snapshot.
+    VmResume,
 }
 
 /// What a command does to the world.
@@ -87,32 +101,66 @@ impl CoordinatorCommand {
     /// the commands it already handles, so this module does not have to know
     /// about them.
     pub fn from_wire(command_type: &str) -> Option<Self> {
-        match command_type {
-            "teammate_list" => Some(Self::TeammateList),
-            "secret_pending_list" => Some(Self::SecretPendingList),
-            "secret_fulfil" => Some(Self::SecretFulfil),
-            "secret_deny" => Some(Self::SecretDeny),
-            "vm_list" => Some(Self::VmList),
+        // Delegated. The wire names live in ferrosa-control-vocabulary, which
+        // the app compiles too, so the two sides cannot spell a command
+        // differently. They did: coordinator_offer was added here, the app
+        // spelled it the same by luck, and a streamer built against another
+        // worktree knew neither.
+        match ferrosa_control_vocabulary::Command::from_wire(command_type) {
+            ferrosa_control_vocabulary::Command::TeammateList => Some(Self::TeammateList),
+            ferrosa_control_vocabulary::Command::SecretPendingList => Some(Self::SecretPendingList),
+            ferrosa_control_vocabulary::Command::SecretFulfil => Some(Self::SecretFulfil),
+            ferrosa_control_vocabulary::Command::SecretDeny => Some(Self::SecretDeny),
+            ferrosa_control_vocabulary::Command::VmList => Some(Self::VmList),
+            ferrosa_control_vocabulary::Command::CoordinatorOffer => Some(Self::CoordinatorOffer),
+            ferrosa_control_vocabulary::Command::VmLaunch => Some(Self::VmLaunch),
+            ferrosa_control_vocabulary::Command::VmHibernate => Some(Self::VmHibernate),
+            ferrosa_control_vocabulary::Command::VmResume => Some(Self::VmResume),
+            // Not a coordinator command, or not one this build knows. `None`
+            // lets the caller fall through to what it already handles.
             _ => None,
         }
     }
 
-    /// The wire name.
-    pub fn as_wire(self) -> &'static str {
+    /// The shared vocabulary's name for this command.
+    fn shared(self) -> ferrosa_control_vocabulary::Command {
         match self {
-            Self::TeammateList => "teammate_list",
-            Self::SecretPendingList => "secret_pending_list",
-            Self::SecretFulfil => "secret_fulfil",
-            Self::SecretDeny => "secret_deny",
-            Self::VmList => "vm_list",
+            Self::TeammateList => ferrosa_control_vocabulary::Command::TeammateList,
+            Self::SecretPendingList => ferrosa_control_vocabulary::Command::SecretPendingList,
+            Self::SecretFulfil => ferrosa_control_vocabulary::Command::SecretFulfil,
+            Self::SecretDeny => ferrosa_control_vocabulary::Command::SecretDeny,
+            Self::VmList => ferrosa_control_vocabulary::Command::VmList,
+            Self::CoordinatorOffer => ferrosa_control_vocabulary::Command::CoordinatorOffer,
+            Self::VmLaunch => ferrosa_control_vocabulary::Command::VmLaunch,
+            Self::VmHibernate => ferrosa_control_vocabulary::Command::VmHibernate,
+            Self::VmResume => ferrosa_control_vocabulary::Command::VmResume,
         }
     }
 
-    /// Whether this command changes anything.
+    /// The wire name, from the shared vocabulary.
+    pub fn as_wire(self) -> &'static str {
+        // Matched back to a literal because callers want `&'static str`, and
+        // the shared crate returns a borrow of the command. The round trip is
+        // asserted in the tests below, so this cannot drift from it silently.
+        match self.shared() {
+            ferrosa_control_vocabulary::Command::TeammateList => "teammate_list",
+            ferrosa_control_vocabulary::Command::SecretPendingList => "secret_pending_list",
+            ferrosa_control_vocabulary::Command::SecretFulfil => "secret_fulfil",
+            ferrosa_control_vocabulary::Command::SecretDeny => "secret_deny",
+            ferrosa_control_vocabulary::Command::VmList => "vm_list",
+            ferrosa_control_vocabulary::Command::CoordinatorOffer => "coordinator_offer",
+            ferrosa_control_vocabulary::Command::VmLaunch => "vm_launch",
+            ferrosa_control_vocabulary::Command::VmHibernate => "vm_hibernate",
+            ferrosa_control_vocabulary::Command::VmResume => "vm_resume",
+            _ => unreachable!("shared() only returns coordinator commands"),
+        }
+    }
+
+    /// Whether this command changes anything. Classified once, shared.
     pub fn effect(self) -> Effect {
-        match self {
-            Self::TeammateList | Self::SecretPendingList | Self::VmList => Effect::Read,
-            Self::SecretFulfil | Self::SecretDeny => Effect::Write,
+        match self.shared().effect() {
+            ferrosa_control_vocabulary::Effect::Read => Effect::Read,
+            ferrosa_control_vocabulary::Effect::Write => Effect::Write,
         }
     }
 
@@ -131,7 +179,7 @@ impl CoordinatorCommand {
     /// consult this before rendering one, because the redaction that protects
     /// the value on the app side does not travel with the JSON.
     pub fn carries_secret(self) -> bool {
-        matches!(self, Self::SecretFulfil)
+        self.shared().carries_secret()
     }
 }
 
@@ -190,6 +238,36 @@ pub fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launching_arrives_as_a_coordinator_write() {
+        assert_eq!(
+            CoordinatorCommand::from_wire("vm_launch"),
+            Some(CoordinatorCommand::VmLaunch)
+        );
+        assert_eq!(CoordinatorCommand::VmLaunch.effect(), Effect::Write);
+    }
+
+    #[test]
+    fn hibernate_and_resume_arrive_as_coordinator_commands() {
+        assert_eq!(
+            CoordinatorCommand::from_wire("vm_hibernate"),
+            Some(CoordinatorCommand::VmHibernate)
+        );
+        assert_eq!(
+            CoordinatorCommand::from_wire("vm_resume"),
+            Some(CoordinatorCommand::VmResume)
+        );
+    }
+
+    #[test]
+    fn hibernating_is_a_write_even_though_it_sits_beside_vm_list() {
+        // vm_list is a Read and these are its neighbours. A command that stops
+        // a running machine must never be classified with it, because Effect is
+        // what a read-only guard consults.
+        assert_eq!(CoordinatorCommand::VmHibernate.effect(), Effect::Write);
+        assert_eq!(CoordinatorCommand::VmResume.effect(), Effect::Write);
+    }
 
     fn device() -> Vec<String> {
         vec![COORDINATOR_CAPABILITY.to_owned()]
@@ -421,5 +499,88 @@ mod dispatch_contract_tests {
         assert!(CoordinatorCommand::SecretFulfil.carries_secret());
         assert!(!CoordinatorCommand::SecretDeny.carries_secret());
         assert!(!CoordinatorCommand::TeammateList.carries_secret());
+    }
+}
+
+#[cfg(test)]
+mod shared_vocabulary_tests {
+    use super::*;
+
+    /// Every coordinator command this listener knows must round-trip through
+    /// the SHARED vocabulary. This is the test that would have caught the
+    /// drift: a name spelled differently here than in the crate the app also
+    /// compiles fails immediately, rather than becoming a command the app
+    /// sends and the listener silently does not recognise.
+    #[test]
+    fn every_command_round_trips_through_the_shared_vocabulary() {
+        for command in [
+            CoordinatorCommand::TeammateList,
+            CoordinatorCommand::SecretPendingList,
+            CoordinatorCommand::SecretFulfil,
+            CoordinatorCommand::SecretDeny,
+            CoordinatorCommand::VmList,
+            CoordinatorCommand::CoordinatorOffer,
+        ] {
+            let wire = command.as_wire();
+            assert_eq!(
+                CoordinatorCommand::from_wire(wire),
+                Some(command),
+                "{wire} did not round trip"
+            );
+            // And the shared crate agrees this is a coordinator command.
+            assert!(
+                ferrosa_control_vocabulary::Command::from_wire(wire).is_coordinator_command(),
+                "{wire} is not a coordinator command in the shared vocabulary"
+            );
+        }
+    }
+
+    /// A name the shared vocabulary knows but which is NOT a coordinator
+    /// command must not be accepted here. Otherwise the listener would forward
+    /// a note or an agent launch to the coordinator's HTTP API.
+    #[test]
+    fn non_coordinator_commands_are_refused() {
+        for wire in ["note_open", "note_append", "note_commit", "agent_launch"] {
+            assert_eq!(
+                CoordinatorCommand::from_wire(wire),
+                None,
+                "{wire} was accepted as a coordinator command"
+            );
+        }
+    }
+
+    /// A name from a newer build is not a coordinator command here.
+    #[test]
+    fn an_unknown_name_is_not_accepted() {
+        assert_eq!(CoordinatorCommand::from_wire("from_a_newer_build"), None);
+    }
+
+    /// Effect and secret-carrying come from the shared crate, so the app and
+    /// the listener cannot disagree about whether a command is a read or
+    /// whether its frame may be logged.
+    #[test]
+    fn effect_and_secrecy_match_the_shared_vocabulary() {
+        for command in [
+            CoordinatorCommand::TeammateList,
+            CoordinatorCommand::VmList,
+            CoordinatorCommand::CoordinatorOffer,
+            CoordinatorCommand::SecretFulfil,
+            CoordinatorCommand::SecretDeny,
+        ] {
+            let shared = ferrosa_control_vocabulary::Command::from_wire(command.as_wire());
+            let shared_is_read = shared.effect() == ferrosa_control_vocabulary::Effect::Read;
+            assert_eq!(
+                command.effect() == Effect::Read,
+                shared_is_read,
+                "{} disagrees about its effect",
+                command.as_wire()
+            );
+            assert_eq!(
+                command.carries_secret(),
+                shared.carries_secret(),
+                "{} disagrees about carrying a secret",
+                command.as_wire()
+            );
+        }
     }
 }

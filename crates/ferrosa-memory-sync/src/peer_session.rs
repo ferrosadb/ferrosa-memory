@@ -170,6 +170,11 @@ enum ControlFrame {
     Ready,
     /// Learner applied the pack.
     Applied,
+    /// Teacher received the learner's applied receipt.
+    AppliedAck,
+    /// Learner received the teacher's receipt acknowledgement and is ready
+    /// for the session to close.
+    Complete,
     /// Learner failed terminally.
     Failed { error: String },
 }
@@ -610,7 +615,19 @@ pub async fn run_teacher_session<S: SignalingApi>(
     // 6. Wait for the applied receipt.
     loop {
         match next_control(&mut control_rx, cfg.transfer_timeout, "applied receipt").await? {
-            ControlFrame::Applied => break,
+            ControlFrame::Applied => {
+                send_control(&dc, &ControlFrame::AppliedAck).await?;
+                break;
+            }
+            ControlFrame::Failed { error } => {
+                return Err(PeerSessionError::LearnerFailed(error));
+            }
+            _ => continue,
+        }
+    }
+    loop {
+        match next_control(&mut control_rx, cfg.transfer_timeout, "receipt completion").await? {
+            ControlFrame::Complete => break,
             ControlFrame::Failed { error } => {
                 return Err(PeerSessionError::LearnerFailed(error));
             }
@@ -830,6 +847,27 @@ where
         tokio::time::sleep(cfg.poll_interval).await;
     };
     send_control(&dc, &ControlFrame::Applied).await?;
+    loop {
+        match next_control(
+            &mut control_rx,
+            cfg.transfer_timeout,
+            "receipt acknowledgement",
+        )
+        .await?
+        {
+            ControlFrame::AppliedAck => {
+                send_control(&dc, &ControlFrame::Complete).await?;
+                if !wait_channel_closed(&dc, cfg.transfer_timeout).await {
+                    return Err(PeerSessionError::Timeout("session close"));
+                }
+                break;
+            }
+            ControlFrame::Failed { error } => {
+                return Err(PeerSessionError::LearnerFailed(error));
+            }
+            _ => continue,
+        }
+    }
     close_quietly(&pc).await;
     Ok(health)
 }
@@ -873,6 +911,23 @@ async fn wait_channel_open(
         // fired on a handler registered after the state change.
         let slice = remaining.min(Duration::from_millis(250));
         let _ = tokio::time::timeout(slice, notified).await;
+    }
+}
+
+/// Wait for the peer to close after the final receipt handshake. The learner
+/// must keep the channel alive after sending `Complete`; closing immediately
+/// can discard that last control frame before the teacher receives it.
+async fn wait_channel_closed(dc: &Arc<RTCDataChannel>, deadline: Duration) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        if dc.ready_state() == RTCDataChannelState::Closed {
+            return true;
+        }
+        let remaining = match deadline.checked_sub(start.elapsed()) {
+            Some(r) if !r.is_zero() => r,
+            _ => return false,
+        };
+        tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
     }
 }
 

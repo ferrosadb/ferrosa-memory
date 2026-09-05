@@ -1314,6 +1314,9 @@ async fn dispatch_tool<S: crate::storage::Storage>(
         "batch_ingest" => Box::pin(handle_batch_ingest(args, storage, ctx, session)),
         "ingest_entities" => Box::pin(handle_ingest_entities(args, storage, ctx, session)),
         "retrieve_entities" => Box::pin(handle_retrieve_entities(args, storage, ctx, session)),
+        "note_share_create" => Box::pin(handle_note_share_create(args, storage, ctx)),
+        "note_share_read" => Box::pin(handle_note_share_read(args, storage, ctx, session)),
+        "note_share_revoke" => Box::pin(handle_note_share_revoke(args, storage, ctx)),
         "list_entities" => Box::pin(handle_list_entities(args, storage, ctx)),
         "record_outcome" => Box::pin(handle_record_outcome(args, storage, ctx)),
         "record_feedback" | "record_last_retrieval_feedback" => {
@@ -1595,6 +1598,7 @@ fn is_tier1(name: &str) -> bool {
             | "session_task_observe"
             | "get_stats"
             | "retrieve_entities"
+            | "note_share_read"
             | "list_entities"
             | "forget"
     )
@@ -1641,6 +1645,8 @@ fn is_write_tool(name: &str) -> bool {
             | "batch_update_entities"
             | "batch_delete_entities"
             | "enrich_entities"
+            | "note_share_create"
+            | "note_share_revoke"
     )
 }
 
@@ -4455,6 +4461,192 @@ async fn handle_retrieve_entities<S: crate::storage::Storage>(
         })
         .collect();
     serde_json::to_value(&slim).map_err(|e| (INTERNAL_ERROR, e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteShareCreateArgs {
+    note_id: uuid::Uuid,
+    recipient_account_id: uuid::Uuid,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    successful_read_limit: Option<u32>,
+    frozen_summary: Option<String>,
+}
+
+async fn handle_note_share_create<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let request: NoteShareCreateArgs = serde_json::from_value(args)
+        .map_err(|e| (INVALID_PARAMS, format!("invalid note share: {e}")))?;
+    let expires_at = request
+        .expires_at
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(7));
+    if expires_at <= chrono::Utc::now() {
+        return Err((INVALID_PARAMS, "expires_at must be in the future".into()));
+    }
+    let content = request
+        .frozen_summary
+        .map(crate::note_share::NoteShareContent::FrozenSummary)
+        .unwrap_or(crate::note_share::NoteShareContent::LiveNote);
+    let share_id = uuid::Uuid::new_v4();
+    let share = crate::note_share::NoteShare::new(
+        share_id,
+        request.note_id,
+        request.recipient_account_id,
+        content,
+        match request.successful_read_limit {
+            Some(limit) => crate::note_share::NoteSharePolicy::with_read_limit(expires_at, limit),
+            None => crate::note_share::NoteSharePolicy::expires_at(expires_at),
+        },
+    );
+    if storage.note_share_persistence_enabled() {
+        storage
+            .note_share_persist(ctx.tenant_id, &share)
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("persist note share: {error}")))?;
+    }
+    crate::note_share::global_ledger()
+        .lock()
+        .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?
+        .insert(ctx.tenant_id, share)
+        .map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+    Ok(serde_json::json!({
+        "share_id": share_id,
+        "note_id": request.note_id,
+        "recipient_account_id": request.recipient_account_id,
+        "expires_at": expires_at,
+        "read_only": true,
+        "re_share_allowed": false,
+    }))
+}
+
+async fn handle_note_share_read<S: crate::storage::Storage>(
+    args: Value,
+    storage: &S,
+    ctx: &crate::types::TenantContext,
+    session: &SessionState,
+) -> Result<Value, (i32, String)> {
+    let share_id = require_uuid(&args, "share_id")?;
+    let now = chrono::Utc::now();
+    if storage.note_share_persistence_enabled()
+        && let Some((owner, share)) = storage
+            .note_share_load(share_id)
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("load note share: {error}")))?
+    {
+        let mut ledger = crate::note_share::global_ledger()
+            .lock()
+            .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?;
+        ledger.replace(owner, share);
+    }
+    let (content, attempt, owner_account_id, note_id) = {
+        let mut ledger = crate::note_share::global_ledger()
+            .lock()
+            .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?;
+        let record = ledger
+            .record(share_id)
+            .ok_or((INVALID_PARAMS, "unknown note share".into()))?;
+        let owner = record.owner_account_id;
+        let note_id = record.share.note_id;
+        let (content, attempt) = if let Some(entitlement_value) = args.get("entitlement") {
+            let entitlement: crate::remote_identity::SignedEnvelope<
+                crate::note_share::NoteShareEntitlement,
+            > = serde_json::from_value(entitlement_value.clone())
+                .map_err(|e| (INVALID_PARAMS, format!("invalid signed entitlement: {e}")))?;
+            let public_identity: crate::remote_identity::InstancePublicIdentity = args
+                .get("owner_public_identity")
+                .ok_or((
+                    INVALID_PARAMS,
+                    "owner_public_identity is required with entitlement".into(),
+                ))
+                .and_then(|value| {
+                    serde_json::from_value(value.clone()).map_err(|e| {
+                        (
+                            INVALID_PARAMS,
+                            format!("invalid owner public identity: {e}"),
+                        )
+                    })
+                })?;
+            ledger
+                .begin_read_with_entitlement(
+                    share_id,
+                    &entitlement,
+                    &public_identity,
+                    ctx.tenant_id,
+                    now,
+                )
+                .map_err(|e| (INVALID_PARAMS, e.to_string()))?
+        } else {
+            ledger
+                .begin_read(share_id, ctx.tenant_id, now)
+                .map_err(|e| (INVALID_PARAMS, e.to_string()))?
+        };
+        (content, attempt, owner, note_id)
+    };
+
+    let result = match content {
+        crate::note_share::NoteShareContent::FrozenSummary(summary) => {
+            serde_json::json!({"note_id": note_id, "content": summary, "content_type": "summary"})
+        }
+        crate::note_share::NoteShareContent::LiveNote => {
+            let session_id = optional_uuid(&args, "session_id")?
+                .or(session.effective_default_session_id())
+                .unwrap_or(uuid::Uuid::nil());
+            let owner_ctx = crate::types::TenantContext {
+                tenant_id: owner_account_id,
+                session_origin: ctx.session_origin.clone(),
+            };
+            let entity = storage
+                .entity_get_by_id(&owner_ctx, session_id, note_id)
+                .await
+                .map_err(|e| (INTERNAL_ERROR, e.to_string()))?
+                .ok_or((INVALID_PARAMS, "shared note not found".into()))?;
+            serde_json::json!({
+                "note_id": note_id,
+                "content_type": "live",
+                "title": entity.entity_name,
+                "content": entity.context_snippet,
+                "entity_type": entity.entity_type,
+            })
+        }
+    };
+    let completed = crate::note_share::global_ledger()
+        .lock()
+        .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?
+        .complete_read(share_id, attempt, chrono::Utc::now());
+    if let Err(error) = completed {
+        return Err((INVALID_PARAMS, error.to_string()));
+    }
+    if storage.note_share_persistence_enabled() {
+        storage
+            .note_share_audit_read(share_id, ctx.tenant_id, "success")
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("audit note-share read: {error}")))?;
+    }
+    Ok(result)
+}
+
+async fn handle_note_share_revoke(
+    args: Value,
+    storage: &impl crate::storage::Storage,
+    ctx: &crate::types::TenantContext,
+) -> Result<Value, (i32, String)> {
+    let share_id = require_uuid(&args, "share_id")?;
+    if storage.note_share_persistence_enabled()
+        && !storage
+            .note_share_revoke_durable(share_id, ctx.tenant_id)
+            .await
+            .map_err(|error| (INTERNAL_ERROR, format!("revoke note share: {error}")))?
+    {
+        return Err((INVALID_PARAMS, "note share not found".into()));
+    }
+    crate::note_share::global_ledger()
+        .lock()
+        .map_err(|_| (INTERNAL_ERROR, "note share ledger unavailable".into()))?
+        .revoke(share_id, ctx.tenant_id)
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    Ok(serde_json::json!({"share_id": share_id, "revoked": true}))
 }
 
 fn parse_entity_list_scope(args: &Value) -> Result<crate::types::EntityListScope, (i32, String)> {
@@ -12411,7 +12603,6 @@ mod tests {
             selected.profile
         );
         assert_eq!(selected.intent, "default_balanced_workspace");
-
         // Without workspace cwd, the same query must fall through to the
         // bare auto profile (backward compat).
         let no_ws = select_auto_fusion_profile(
@@ -14260,7 +14451,7 @@ mod tests {
             expected_tier1,
             "default tools/list should return all tier-1 tools"
         );
-        assert_eq!(tools.len(), 22, "tier-1 tool surface should stay compact");
+        assert_eq!(tools.len(), 23, "tier-1 tool surface should stay compact");
         assert!(
             tools.iter().any(|t| t["name"].as_str() == Some("forget")),
             "forget is a tier-1 tool"
@@ -19561,32 +19752,95 @@ mod speculative_tests {
         assert_eq!(source, "derived_from_session_id");
     }
 
-    /// Characterization snapshot of the full tool catalog. Guards the
-    /// behavior-preserving `tool_definitions` decomposition: the serialized
-    /// catalog must stay byte-identical as the giant function is split into
-    /// per-family builders. Regenerate intentionally with `UPDATE_SNAPSHOTS=1`
-    /// (only when a tool schema is deliberately changed).
+    /// Characterization snapshot of the tool catalog, ONE FILE PER FAMILY.
+    ///
+    /// Guards the behavior-preserving `tool_definitions` decomposition: each
+    /// family's serialized tools must stay byte-identical as builders move.
+    /// Regenerate intentionally with `UPDATE_SNAPSHOTS=1` (only when a tool
+    /// schema is deliberately changed).
+    ///
+    /// Split per family on purpose. A single 98-tool golden file made every
+    /// session that touched any schema rewrite the same blob, so unrelated
+    /// work collided on merge and the fix was to regenerate — which is exactly
+    /// how an unintended schema change slips through a conflict resolution.
+    /// Per-family files mean a change to `search` cannot conflict with a
+    /// change to `graph`, and the guard stays byte-exact either way.
     #[test]
     fn tool_definitions_catalog_snapshot() {
+        use std::collections::BTreeMap;
         let sample = [
             "person".to_string(),
             "place".to_string(),
             "organization".to_string(),
         ];
-        let actual = serde_json::to_string_pretty(&tool_definitions(&sample)).unwrap() + "\n";
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/snapshots/tool_definitions_catalog.json"
-        );
-        if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
-            std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
-            std::fs::write(path, &actual).unwrap();
+        let mut by_family: BTreeMap<&'static str, Vec<tool_schemas::ToolDef>> = BTreeMap::new();
+        for record in tool_schemas::tool_definition_records(&sample) {
+            by_family
+                .entry(record.category)
+                .or_default()
+                .push(record.tool);
         }
-        let expected = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            !by_family.is_empty(),
+            "the catalog produced no families at all"
+        );
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots/tool_catalog");
+        if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
+            std::fs::create_dir_all(dir).unwrap();
+            // Remove files for families that no longer exist, so a deleted
+            // family cannot leave a stale golden file behind claiming it does.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let keep = entry
+                        .path()
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| by_family.contains_key(stem))
+                        .unwrap_or(false);
+                    if !keep {
+                        std::fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+            }
+            for (family, tools) in &by_family {
+                let text = serde_json::to_string_pretty(tools).unwrap() + "\n";
+                std::fs::write(format!("{dir}/{family}.json"), text).unwrap();
+            }
+        }
+
+        for (family, tools) in &by_family {
+            let path = format!("{dir}/{family}.json");
+            let actual = serde_json::to_string_pretty(tools).unwrap() + "\n";
+            let expected = std::fs::read_to_string(&path).unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "tool catalog family `{family}` changed — the refactor must be \
+                 behavior-preserving. If a schema change is intentional, \
+                 regenerate with UPDATE_SNAPSHOTS=1."
+            );
+        }
+
+        // A family that stops being produced must fail here rather than leave
+        // its golden file sitting on disk unread.
+        let on_disk: std::collections::BTreeSet<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        e.path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let produced: std::collections::BTreeSet<String> =
+            by_family.keys().map(|k| (*k).to_owned()).collect();
         assert_eq!(
-            actual, expected,
-            "tool_definitions catalog changed — the refactor must be behavior-preserving. \
-             If a schema change is intentional, regenerate with UPDATE_SNAPSHOTS=1."
+            on_disk, produced,
+            "tool catalog families on disk do not match the families produced"
         );
     }
 

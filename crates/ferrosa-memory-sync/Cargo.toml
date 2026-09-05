@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The control-channel command vocabulary, shared with the app so the two
+# cannot spell a command differently. A path dependency, not a pinned rev:
+# these are all ours and a pin would be a second place to bump.
+ferrosa-control-vocabulary = { path = "../ferrosa-control-vocabulary" }
 # Terminal output is raw bytes — escape sequences, and whatever encoding the
 # program chose. JSON strings cannot carry that, and lossy UTF-8 conversion
 # would corrupt exactly the control sequences the emulator needs.
@@ -53,7 +57,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 
 [features]
 # Pulls the webrtc-rs ICE/DTLS/SCTP/SRTP stack and enables the concrete
-# `peer_transport::webrtc` channel. Off by default to keep non-P2P builds light.
+# `peer_transport::webrtc` channel. Enabled by default because the
+# `memory-sync` binary's control-listen command requires it.
+default = ["webrtc-transport"]
 webrtc-transport = ["dep:webrtc", "dep:bytes", "dep:reqwest", "dep:x25519-dalek", "dep:rustls"]
 
 [lib]

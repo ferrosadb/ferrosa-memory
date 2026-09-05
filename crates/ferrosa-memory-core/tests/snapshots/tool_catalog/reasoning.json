@@ -1,0 +1,151 @@
+[
+  {
+    "name": "derive",
+    "description": "Query Datalog-derived facts with provenance.\n\nCALL WHEN:\n- You need to explain why entity A relates to entity B\n- You want transitive closure (related, reachable, isa)\n- You need derived facts with explanation chains\n\nDO NOT CALL:\n- For raw entity retrieval (use retrieve_entities)\n\nCost: Cache hit is free. Cache miss computes Datalog evaluation.",
+    "inputSchema": {
+      "properties": {
+        "predicate": {
+          "description": "Derived predicate to query (e.g., 'related', 'reachable', 'isa', 'cluster')",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session UUID",
+          "type": "string"
+        }
+      },
+      "required": [
+        "predicate"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "pred_promote",
+    "description": "Promote a derived predicate to durable materialization.\n\nCALL WHEN:\n- A derived predicate is queried frequently and you want faster access\n- You want to persist inference results beyond the ephemeral cache TTL\n\nCost: Runs Datalog evaluation + writes to durable tables.",
+    "inputSchema": {
+      "properties": {
+        "predicate": {
+          "description": "Predicate to promote (e.g., 'related', 'isa', 'reachable')",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session UUID",
+          "type": "string"
+        }
+      },
+      "required": [
+        "predicate"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "derived_cache",
+    "description": "List all derived cache entries for inspection/debugging.\n\nReturns up to `limit` rows sorted by computed_at DESC.\n\nUse for: audit trail, debugging derivation results, reviewing cache state.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max rows to return (default 100)",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tenant_id": {
+          "description": "Tenant UUID",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

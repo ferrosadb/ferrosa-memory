@@ -1,0 +1,427 @@
+[
+  {
+    "name": "explore",
+    "description": "Traverses the knowledge graph. Supports 4 traversal types:\n- fold_ancestors: walk the fold hierarchy upward from a fold\n- related_entities: find entities connected within N hops\n- entities_in_fold: list all entities mentioned in a fold\n- supersession_chain: follow temporal supersession links from a fact\n\nCALL WHEN: You need to understand relationships between entities or folds, or trace how facts evolved over time.\nRequires a graph connection to be configured.\nCost: ~10-50ms depending on traversal depth.",
+    "inputSchema": {
+      "properties": {
+        "entity_id": {
+          "description": "Entity or event ID (required for related_entities, supersession_chain)",
+          "format": "uuid",
+          "type": "string"
+        },
+        "fold_id": {
+          "description": "Fold ID (required for fold_ancestors, entities_in_fold)",
+          "format": "uuid",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum results to return (default: 10)",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_depth": {
+          "description": "Maximum traversal depth (default: 2)",
+          "maximum": 5,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Session ID (required for fold_ancestors, related_entities, entities_in_fold)",
+          "type": "string"
+        },
+        "traversal": {
+          "description": "The type of graph traversal to perform",
+          "enum": [
+            "fold_ancestors",
+            "related_entities",
+            "entities_in_fold",
+            "supersession_chain"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "traversal"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "chain",
+    "description": "Discovers the shortest path between two entities through the knowledge graph using BFS traversal. Returns the chain of intermediate entities and edge types connecting source to destination.\n\nCALL WHEN: You need to understand HOW two concepts are related — not just whether they are, but the path of connections between them. Useful for explaining reasoning chains, tracing provenance, or finding indirect relationships.\nRETURNS: Ordered list of steps (entity_id + edge_type) forming the shortest path, plus hop count and confidence score.\nCost: ~5-20ms depending on graph density.",
+    "inputSchema": {
+      "properties": {
+        "destination": {
+          "description": "Entity ID to find path to",
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_hops": {
+          "description": "Maximum path length (default: 5)",
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Entity ID to start from",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "destination"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "edge",
+    "description": "Create a typed, labeled edge between two entities.\n\nCALL WHEN:\n- Building a knowledge graph with semantic relationships\n- Recording dependencies (depends_on), containment (contains), inheritance (subclass_of)\n- Any time you discover a specific relationship between entities\n\nEdge types: depends_on, contains, part_of, subclass_of, calls, implements, uses, related_to\n\nCost: ~5ms per edge.",
+    "inputSchema": {
+      "properties": {
+        "dst_entity_id": {
+          "description": "Destination entity UUID",
+          "format": "uuid",
+          "type": "string"
+        },
+        "edge_type": {
+          "description": "Relationship type (depends_on, contains, part_of, subclass_of, calls, implements, uses)",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional metadata about the relationship",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "src_entity_id": {
+          "description": "Source entity UUID",
+          "format": "uuid",
+          "type": "string"
+        },
+        "weight": {
+          "description": "Edge strength (default 1.0)",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "src_entity_id",
+        "dst_entity_id",
+        "edge_type"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "edges_add",
+    "description": "Create multiple typed edges in a single call.\n\nCost: ~5ms + 2ms per edge.",
+    "inputSchema": {
+      "properties": {
+        "edges": {
+          "items": {
+            "properties": {
+              "dst_entity_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "edge_type": {
+                "type": "string"
+              },
+              "src_entity_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "weight": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "src_entity_id",
+              "dst_entity_id",
+              "edge_type"
+            ],
+            "type": "object"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "edges"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "edges_update",
+    "description": "Update typed edges in bulk by (src_entity_id, dst_entity_id, edge_type).\n\nCurrent storage semantics write through `typed_edge_put`; this is treated as upsert/update-compatible where supported.",
+    "inputSchema": {
+      "properties": {
+        "edges": {
+          "items": {
+            "properties": {
+              "dst_entity_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "edge_type": {
+                "type": "string"
+              },
+              "metadata": {
+                "type": "string"
+              },
+              "src_entity_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "weight": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "src_entity_id",
+              "dst_entity_id",
+              "edge_type"
+            ],
+            "type": "object"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "edges"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "edges_delete",
+    "description": "Delete typed edges in bulk.\n\nUses the current graph-backed delete path and returns structured per-row success/failure results.",
+    "inputSchema": {
+      "properties": {
+        "edges": {
+          "description": "Typed edges to delete",
+          "items": {
+            "properties": {
+              "dst_entity_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "edge_type": {
+                "type": "string"
+              },
+              "src_entity_id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "src_entity_id",
+              "dst_entity_id",
+              "edge_type"
+            ],
+            "type": "object"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "edges"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

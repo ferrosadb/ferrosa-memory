@@ -1,0 +1,1179 @@
+[
+  {
+    "name": "ctx_ingest",
+    "description": "Persist raw pre-compaction conversation context as deterministic semantic segments, with Nomic embeddings when configured and temporal prev/next links for later expansion.",
+    "inputSchema": {
+      "properties": {
+        "conversation_id": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "embed_missing": {
+          "type": "boolean"
+        },
+        "messages": {
+          "items": {
+            "properties": {
+              "content": {
+                "maxLength": 131072,
+                "type": "string"
+              },
+              "created_at": {
+                "description": "Optional RFC3339 timestamp",
+                "type": "string"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "role": {
+                "type": "string"
+              },
+              "turn_index": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "role",
+              "content",
+              "turn_index"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "segmentation": {
+          "type": "object"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "messages"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "ctx_search",
+    "description": "Hybrid-search raw context segments with lexical BM25 fallback plus Nomic vector ANN, optionally returning bounded prev/next temporal expansion windows.",
+    "inputSchema": {
+      "properties": {
+        "expand": {
+          "properties": {
+            "max_tokens": {
+              "maximum": 50000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "next": {
+              "maximum": 10,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "prev": {
+              "maximum": 10,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "limit": {
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "query_embedding": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "ctx_window",
+    "description": "Return ordered previous/hit/next context segment pages around a retrieved segment using temporal edges, bounded by token budget.",
+    "inputSchema": {
+      "properties": {
+        "max_tokens": {
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "next": {
+          "maximum": 20,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prev": {
+          "maximum": 20,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "segment_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "segment_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "turn_chain",
+    "description": "Walk the next_turn temporal edge chain from a starting turn entity, returning turns in forward (chronological arrival) order.\n\nCALL WHEN: You need to reconstruct what happened in an agent session after a known turn, follow a conversation thread, or inspect the sequence of turns the harness hook captured.\nRETURNS: ordered list of turn entities from start_turn_id forward, up to limit turns.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "default": 20,
+          "description": "Maximum number of turns to return",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Session partition for the turn chain. Omit or pass \"default\" to use the configured default session.",
+          "type": "string"
+        },
+        "start_turn_id": {
+          "description": "Entity ID of the first turn to include",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_turn_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "chunk_ctx",
+    "description": "Expand a retrieved document chunk through semantic prev/next links. Use after search returns a document_chunk hit whose answer may sit in adjacent chunks or split list items.",
+    "inputSchema": {
+      "properties": {
+        "chunk_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_tokens": {
+          "maximum": 50000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "next": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prev": {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "chunk_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "memo",
+    "description": "Looks up a prior sub-call result by content hash. Returns cached result if found, or miss signal if not.\n\nCALL WHEN: Before every sub-LLM invocation within a long-horizon task. This is the first step in the usage loop.\nDO NOT CALL: For top-level queries or tasks where you are not making sub-calls. Do not call more than once per sub-call.\nON HIT: Use the cached result directly. Do not invoke the sub-LLM. Call record_outcome with program_type='memo_hit'.\nON MISS: Proceed with the sub-call. After it completes, call store_memo_result.\nCost: ~1ms. Zero token cost.",
+    "inputSchema": {
+      "properties": {
+        "context_slice": {
+          "description": "Context slice for cache key",
+          "maxLength": 131072,
+          "type": "string"
+        },
+        "model_version": {
+          "description": "Model version string",
+          "maxLength": 64,
+          "type": "string"
+        },
+        "prompt": {
+          "description": "The prompt text",
+          "maxLength": 4096,
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt",
+        "context_slice",
+        "model_version"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "memo_store",
+    "description": "Stores a completed sub-call result for future reuse.\n\nCALL WHEN: Immediately after any sub-call completes on a task where the same chunk might be processed again.\nDO NOT CALL: For top-level responses or ephemeral computations. Do not call if check_memo_cache returned a hit.\nCost: ~5ms write.",
+    "inputSchema": {
+      "properties": {
+        "context_slice": {
+          "maxLength": 131072,
+          "type": "string"
+        },
+        "embedding": {
+          "description": "Optional embedding vector",
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "model_version": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "prompt": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "result": {
+          "description": "The sub-call result to cache",
+          "maxLength": 131072,
+          "type": "string"
+        },
+        "ttl_days": {
+          "description": "TTL in days (default: 7)",
+          "maximum": 365,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "prompt",
+        "context_slice",
+        "model_version",
+        "result"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "plan_write",
+    "description": "Records a sub-task node in the hierarchical plan tree. Enables structured re-injection of parent plan context on recursive return.\n\nCALL WHEN: At the start of each sub-task, before execution. Always call when decomposing a complex task into sub-tasks. Depth=0 is the root goal.\nDO NOT CALL: For single-step tasks with no decomposition.",
+    "inputSchema": {
+      "properties": {
+        "depth": {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "goal_text": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "parent_subtask": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "subtask_id": {
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "depth",
+        "subtask_id",
+        "goal_text"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "plan",
+    "description": "Returns the full plan tree for the current session as compact JSON. Use to re-inject parent context when returning from recursive sub-tasks.\n\nCALL WHEN: At the start of each sub-task execution and on return from a sub-task call.\nInclude the returned plan tree in your prompt preamble with 'Current task hierarchy:' to prevent goal drift.\nCost: ~2ms.",
+    "inputSchema": {
+      "properties": {
+        "max_depth": {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "plan_update",
+    "description": "Marks a plan node complete or failed and records an outcome summary.\n\nCALL WHEN: When a sub-task finishes (success or failure). Always provide outcome_summary — this is what parent nodes will see.\nWrite outcome_summary describing what was found, not the process used.",
+    "inputSchema": {
+      "properties": {
+        "depth": {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outcome_summary": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "active",
+            "complete",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "subtask_id": {
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "depth",
+        "subtask_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_put",
+    "description": "Creates or upserts a durable fmem-owned session task. If task_id is omitted, fmem generates the canonical id. Use aliases only as scoped client-visible references.\n\nCALL WHEN: Starting work, updating visible work-item metadata, or switching focus to a new task. Prefer this over plan tools for current-task continuity across compaction.",
+    "inputSchema": {
+      "properties": {
+        "alias": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "alias_scope": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "client_agent": {
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 8192,
+          "type": "string"
+        },
+        "external_session_id": {
+          "type": "string"
+        },
+        "focus": {
+          "description": "Default true. Pushes current focus down the stack and focuses this task.",
+          "type": "boolean"
+        },
+        "parent_task_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "priority": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled",
+            "superseded"
+          ],
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "task_id": {
+          "description": "Optional canonical id returned by fmem for updates; omit on create.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_get",
+    "description": "Reads a durable session task by canonical task_id, or by scoped alias when task_id is omitted.\n\nCALL WHEN: Rehydrating task detail after compaction or resolving a client-visible work-item alias.",
+    "inputSchema": {
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "alias_scope": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_current",
+    "description": "Returns the deterministic current-task snapshot: foreground task, active working set, focus stack, and recovery hints.\n\nCALL WHEN: Session starts, after compaction, before writing if the agent may be lost, or before deciding to plan more work.",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_list",
+    "description": "Lists durable session tasks, optionally filtered by lifecycle status. Returns focus/priority sorted tasks.",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled",
+            "superseded"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_done",
+    "description": "Marks a task completed without hard delete. If a suspended task is on the focus stack, returns a resume candidate and action according to policy.",
+    "inputSchema": {
+      "properties": {
+        "outcome_summary": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_cancel",
+    "description": "Marks a task cancelled without hard delete and updates focus stack recovery state.",
+    "inputSchema": {
+      "properties": {
+        "outcome_summary": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_focus",
+    "description": "Moves an existing non-terminal task to foreground and pushes the previous foreground down the focus stack.",
+    "inputSchema": {
+      "properties": {
+        "reason": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_observe",
+    "description": "Deterministic v1 observation hook for clients/hook code. Handles explicit task-shift, completion, and lost-agent signals; returns actions and hints without requiring an LLM judge.",
+    "inputSchema": {
+      "properties": {
+        "event_type": {
+          "enum": [
+            "user_requested_new_task",
+            "user_requested_switch",
+            "task_completed",
+            "agent_lost",
+            "context_reset"
+          ],
+          "type": "string"
+        },
+        "payload": {
+          "type": "object"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "delete_session",
+    "description": "Deletes all memory objects for a session across all tables (right-to-deletion).\n\nCALL WHEN: User explicitly requests data deletion, or session cleanup is needed.\nDO NOT CALL: During normal operation. This is destructive and irreversible.",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "properties": {
+        "duration_ms": {
+          "description": "Server-side tool execution duration in milliseconds.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "is_error": {
+          "description": "False for successful tool results.",
+          "type": "boolean"
+        },
+        "requested_tool": {
+          "description": "Tool name requested by the client, after alias resolution.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Canonical tool name that handled the call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "requested_tool",
+        "duration_ms",
+        "is_error"
+      ],
+      "type": "object"
+    }
+  }
+]

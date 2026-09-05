@@ -1,0 +1,11 @@
+[package]
+name = "ferrosa-control-vocabulary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The control-channel command vocabulary, defined once for every side that speaks it."
+
+# No dependencies on purpose. This crate is compiled by the phone, the desktop
+# app, the listener and the streamer, and anything it pulls in they all pull in.
+# The vocabulary is names and classifications; it needs nothing.
+[dependencies]
