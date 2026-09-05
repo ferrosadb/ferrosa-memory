@@ -100,6 +100,34 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ws-noinstrument
+      # `cargo build --workspace --all-targets` compiles every test binary in
+      # the workspace with the dev profile's full debug info, and the nextest
+      # archive below is built from those same artifacts. On a stock
+      # ubuntu-latest runner that has run out of disk:
+      #
+      #   rustc-LLVM ERROR: IO failure on output stream: No space left on device
+      #
+      # which surfaces as `could not compile <crate>` and takes every dependent
+      # job down as SKIPPED, so the run reads as seven broken checks rather than
+      # one full disk. Reclaim the preinstalled toolchains this workspace never
+      # uses -- roughly 25-30 GB -- before compiling.
+      #
+      # Inline rather than a third-party action: this repo's Actions Pin Guard
+      # requires a 40-char SHA pin for every `uses:`, and adding supply-chain
+      # surface to delete directories is a poor trade. `|| true` on each removal
+      # is deliberate and safe -- the runner image contents shift over time, and
+      # a path that has already gone is not a failure.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/share/powershell || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          echo "after:"; df -h / | tail -1
       - name: Build workspace
         run: cargo build --workspace --all-targets
       # 12-factor "build once, run many": compile every test binary here and
