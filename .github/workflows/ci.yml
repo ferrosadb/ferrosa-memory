@@ -357,6 +357,32 @@ jobs:
         with:
           shared-key: ws-noinstrument
           cache-on-failure: false
+      # The Build job is not the only one that runs out of disk. This job
+      # downloads and unpacks the nextest archive, pulls a ferrosa node image,
+      # and brings up a docker-compose cluster -- and it has been seen failing
+      # as `error extracting archive nextest-archive.tar.zst ... No space left
+      # on device (os error 28)`, which names the archive rather than the disk.
+      #
+      # Raising --run-ignored from ignored-only to all makes this worse, not
+      # better: this step now runs 2534 tests where it ran about 22, and every
+      # one of those binaries is unpacked from the archive first.
+      #
+      # Same reclaim as the Build job, same reasoning: it removes preinstalled
+      # toolchains this workspace never uses and touches no compiler flag, so
+      # artifact fingerprints and cache sharing are unaffected. `|| true` per
+      # removal is deliberate -- runner images change, and an absent path is
+      # not a failure.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/share/powershell || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          echo "after:"; df -h / | tail -1
       - name: Install cargo-nextest
         uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
