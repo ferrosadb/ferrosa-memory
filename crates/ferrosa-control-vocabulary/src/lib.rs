@@ -28,7 +28,7 @@
 //! effect, its capability and whether it may carry a secret.
 //!
 //! Last revised: 2026-08-31
-//! Last changed: Created, to stop the two definitions drifting again.
+//! Last changed: Added the VM lifecycle and elevation commands used by mobile.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -74,13 +74,21 @@ pub enum Command {
     /// Named `vm_launch` and not `launch`, one word from `agent_launch`, which
     /// starts a teammate INSIDE a runtime rather than creating one.
     VmLaunch,
+    /// Stop a microVM and discard its running state without archiving it.
+    VmStop,
     /// Write a running microVM to disk and stop it.
     VmHibernate,
     /// Wake a hibernated microVM from its snapshot.
     VmResume,
+    /// Move a stopped microVM workspace to durable storage.
+    VmArchive,
     /// Report what this machine's coordinator can run: which tiers are live,
     /// what images it holds, and how much room is left.
     CoordinatorOffer,
+    /// List elevation requests waiting for a human on this machine.
+    ApprovalList,
+    /// Mark an elevation request handled.
+    ApprovalResolve,
     /// Begin a note.
     NoteOpen,
     /// Add one finalised utterance, or a typed note's whole body.
@@ -102,9 +110,13 @@ impl Command {
             Self::SecretDeny => "secret_deny",
             Self::VmList => "vm_list",
             Self::VmLaunch => "vm_launch",
+            Self::VmStop => "vm_stop",
             Self::VmHibernate => "vm_hibernate",
             Self::VmResume => "vm_resume",
+            Self::VmArchive => "vm_archive",
             Self::CoordinatorOffer => "coordinator_offer",
+            Self::ApprovalList => "approval_list",
+            Self::ApprovalResolve => "approval_resolve",
             Self::NoteOpen => "note_open",
             Self::NoteAppend => "note_append",
             Self::NoteCommit => "note_commit",
@@ -122,9 +134,13 @@ impl Command {
             "secret_deny" => Self::SecretDeny,
             "vm_list" => Self::VmList,
             "vm_launch" => Self::VmLaunch,
+            "vm_stop" => Self::VmStop,
             "vm_hibernate" => Self::VmHibernate,
             "vm_resume" => Self::VmResume,
+            "vm_archive" => Self::VmArchive,
             "coordinator_offer" => Self::CoordinatorOffer,
+            "approval_list" => Self::ApprovalList,
+            "approval_resolve" => Self::ApprovalResolve,
             "note_open" => Self::NoteOpen,
             "note_append" => Self::NoteAppend,
             "note_commit" => Self::NoteCommit,
@@ -151,8 +167,10 @@ impl Command {
                 | Self::SecretDeny
                 | Self::VmList
                 | Self::VmLaunch
+                | Self::VmStop
                 | Self::VmHibernate
                 | Self::VmResume
+                | Self::VmArchive
                 | Self::CoordinatorOffer
         )
     }
@@ -168,13 +186,17 @@ impl Command {
             Self::TeammateList
             | Self::SecretPendingList
             | Self::VmList
+            | Self::ApprovalList
             | Self::CoordinatorOffer => Effect::Read,
             Self::AgentLaunch
             | Self::VmLaunch
+            | Self::VmStop
             | Self::VmHibernate
             | Self::VmResume
+            | Self::VmArchive
             | Self::SecretFulfil
             | Self::SecretDeny
+            | Self::ApprovalResolve
             | Self::NoteOpen
             | Self::NoteAppend
             | Self::NoteCommit
@@ -202,9 +224,13 @@ impl Command {
             Self::SecretDeny,
             Self::VmList,
             Self::VmLaunch,
+            Self::VmStop,
             Self::VmHibernate,
             Self::VmResume,
+            Self::VmArchive,
             Self::CoordinatorOffer,
+            Self::ApprovalList,
+            Self::ApprovalResolve,
             Self::NoteOpen,
             Self::NoteAppend,
             Self::NoteCommit,
@@ -386,6 +412,22 @@ mod tests {
                 !Command::from_wire(raw).is_known(),
                 "{raw:?} matched a known command"
             );
+        }
+    }
+
+    #[test]
+    fn current_mobile_commands_round_trip_and_keep_their_effects() {
+        for (wire, expected, effect, coordinator) in [
+            ("vm_stop", "vm_stop", Effect::Write, true),
+            ("vm_archive", "vm_archive", Effect::Write, true),
+            ("approval_list", "approval_list", Effect::Read, false),
+            ("approval_resolve", "approval_resolve", Effect::Write, false),
+        ] {
+            let command = Command::from_wire(wire);
+            assert_eq!(command.as_wire(), expected);
+            assert_eq!(command.effect(), effect);
+            assert_eq!(command.is_coordinator_command(), coordinator);
+            assert!(command.is_known());
         }
     }
 }
